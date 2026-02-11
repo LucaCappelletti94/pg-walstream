@@ -12,9 +12,23 @@
 //! - Parallel streaming support (protocol v4+)
 //! - Zero-copy buffer operations using `bytes` crate
 //! - Thread-safe LSN tracking
-//! - **Truly async, non-blocking I/O** - Tasks properly yield to the executor
-//! - **Graceful cancellation** - All operations support cancellation tokens
+//! - **Truly async, non-blocking I/O** - Tasks properly yield to the executor (requires `std` feature)
+//! - **Graceful cancellation** - All operations support cancellation tokens (requires `std` feature)
 //! - Protocol parsing is portable; the connection module uses libpq
+//!
+//! ## no_std Support
+//!
+//! This crate supports `no_std` environments with the `alloc` feature. When compiled without
+//! the `std` feature, only protocol parsing functionality is available. Connection management,
+//! streaming, and retry logic require the `std` feature.
+//!
+//! ```toml
+//! # For no_std with alloc (protocol parsing only)
+//! pg_walstream = { version = "0.3", default-features = false, features = ["alloc"] }
+//!
+//! # For full functionality (default)
+//! pg_walstream = "0.3"
+//! ```
 //!
 //! ## Async I/O Performance
 //!
@@ -60,7 +74,7 @@
 //!         "postgresql://postgres:password@localhost:5432/mydb?replication=database",
 //!         config,
 //!     ).await?;
-//!     
+//!
 //!     stream.start(None).await?;
 //!
 //!     let cancel_token = CancellationToken::new();
@@ -82,24 +96,35 @@
 //!             }
 //!         }
 //!     }
-//!     
+//!
 //!     Ok(())
 //! }
 //! ```
 
-// Core modules
+// Enable no_std when std feature is not enabled
+#![cfg_attr(not(feature = "std"), no_std)]
+
+// Import alloc crate for no_std environments
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
+// Core modules (always available)
 pub mod buffer;
 pub mod error;
 pub mod types;
 
-// Protocol implementation
+// Protocol implementation (always available)
 pub mod lsn;
 pub mod protocol;
 
-// High-level stream management
+// High-level stream management (std only)
+#[cfg(feature = "std")]
 pub mod stream;
 
+#[cfg(feature = "std")]
 pub mod connection;
+
+#[cfg(feature = "std")]
 pub mod retry;
 
 // Re-export main types for convenience
@@ -109,12 +134,6 @@ pub use lsn::SharedLsnFeedback;
 
 // Re-export type aliases and utilities
 pub use types::{
-    // Utility functions
-    format_lsn,
-    format_postgres_timestamp,
-    parse_lsn,
-    postgres_timestamp_to_chrono,
-    system_time_to_postgres_timestamp,
     // High-level CDC types
     BaseBackupOptions,
     ChangeEvent,
@@ -133,24 +152,37 @@ pub use types::{
     PG_EPOCH_OFFSET_SECS,
 };
 
+// Utility functions (some require std)
+pub use types::{format_lsn, parse_lsn};
+
+#[cfg(feature = "std")]
+pub use types::{format_postgres_timestamp, postgres_timestamp_to_chrono, system_time_to_postgres_timestamp};
+
 // Re-export protocol types
 pub use protocol::{
     message_types, parse_keepalive_message, ColumnData, ColumnInfo, KeepaliveMessage,
     LogicalReplicationMessage, LogicalReplicationParser, MessageType, RelationInfo,
-    ReplicationState, StreamingReplicationMessage, TupleData,
+    StreamingReplicationMessage, TupleData,
 };
 
-// Re-export stream types
+#[cfg(feature = "std")]
+pub use protocol::{build_hot_standby_feedback_message, ReplicationState};
+
+// Re-export stream types (std only)
+#[cfg(feature = "std")]
 pub use stream::{
     EventStream, EventStreamRef, LogicalReplicationStream, OriginFilter, ReplicationStreamConfig,
     StreamingMode,
 };
 
-// Re-export tokio_util for CancellationToken
+// Re-export tokio_util for CancellationToken (std only)
+#[cfg(feature = "std")]
 pub use tokio_util::sync::CancellationToken;
 
-// Re-export libpq-specific types
+// Re-export libpq-specific types (std only)
+#[cfg(feature = "std")]
 pub use connection::{PgReplicationConnection, PgResult};
 
-// Re-export retry types
+// Re-export retry types (std only)
+#[cfg(feature = "std")]
 pub use retry::{ExponentialBackoff, ReplicationConnectionRetry, RetryConfig};

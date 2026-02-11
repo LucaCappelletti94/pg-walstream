@@ -3,9 +3,18 @@
 //! This module provides type aliases for PostgreSQL types and utility functions
 //! for working with LSN (Log Sequence Numbers) and timestamps.
 
-use crate::error::{ReplicationError, Result};
-use serde::{Deserialize, Serialize};
+#[cfg(not(feature = "std"))]
+use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
+
+#[cfg(feature = "std")]
+use std::{collections::HashMap, format};
+
+#[cfg(feature = "std")]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::error::{ReplicationError, Result};
+use core::ops::{Deref, DerefMut};
+use serde::{Deserialize, Serialize};
 
 // PostgreSQL constants
 /// Seconds from Unix epoch (1970-01-01) to PostgreSQL epoch (2000-01-01)
@@ -77,7 +86,7 @@ impl<T> CachePadded<T> {
     }
 }
 
-impl<T> std::ops::Deref for CachePadded<T> {
+impl<T> Deref for CachePadded<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -85,7 +94,7 @@ impl<T> std::ops::Deref for CachePadded<T> {
     }
 }
 
-impl<T> std::ops::DerefMut for CachePadded<T> {
+impl<T> DerefMut for CachePadded<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.value
     }
@@ -117,6 +126,7 @@ impl<T> std::ops::DerefMut for CachePadded<T> {
 /// let now = SystemTime::now();
 /// let pg_timestamp = system_time_to_postgres_timestamp(now);
 /// ```
+#[cfg(feature = "std")]
 pub fn system_time_to_postgres_timestamp(time: SystemTime) -> TimestampTz {
     let duration_since_unix = time
         .duration_since(UNIX_EPOCH)
@@ -130,6 +140,7 @@ pub fn system_time_to_postgres_timestamp(time: SystemTime) -> TimestampTz {
 }
 
 /// Convert PostgreSQL timestamp to formatted string
+#[cfg(feature = "std")]
 pub fn format_postgres_timestamp(timestamp: TimestampTz) -> String {
     let unix_micros = timestamp + PG_EPOCH_OFFSET_SECS * 1_000_000;
     let unix_secs = unix_micros / 1_000_000;
@@ -141,6 +152,7 @@ pub fn format_postgres_timestamp(timestamp: TimestampTz) -> String {
 }
 
 /// Convert PostgreSQL timestamp (microseconds since 2000-01-01) into `chrono::DateTime<Utc>`.
+#[cfg(feature = "std")]
 pub fn postgres_timestamp_to_chrono(ts: i64) -> chrono::DateTime<chrono::Utc> {
     use chrono::{TimeZone, Utc};
 
@@ -187,16 +199,28 @@ pub fn postgres_timestamp_to_chrono(ts: i64) -> chrono::DateTime<chrono::Utc> {
 /// assert_eq!(lsn, 0);
 /// ```
 pub fn parse_lsn(lsn_str: &str) -> Result<XLogRecPtr> {
-    let parts: Vec<&str> = lsn_str.split('/').collect();
-    if parts.len() != 2 {
+    let mut parts = lsn_str.split('/');
+    let high_str = parts.next().ok_or_else(|| {
+        ReplicationError::protocol(format!(
+            "Invalid LSN format: {lsn_str}. Expected format: high/low"
+        ))
+    })?;
+    let low_str = parts.next().ok_or_else(|| {
+        ReplicationError::protocol(format!(
+            "Invalid LSN format: {lsn_str}. Expected format: high/low"
+        ))
+    })?;
+
+    // Ensure no more parts
+    if parts.next().is_some() {
         return Err(ReplicationError::protocol(format!(
             "Invalid LSN format: {lsn_str}. Expected format: high/low"
         )));
     }
 
-    let high = u64::from_str_radix(parts[0], 16)
+    let high = u64::from_str_radix(high_str, 16)
         .map_err(|e| ReplicationError::protocol(format!("Invalid LSN high part: {e}")))?;
-    let low = u64::from_str_radix(parts[1], 16)
+    let low = u64::from_str_radix(low_str, 16)
         .map_err(|e| ReplicationError::protocol(format!("Invalid LSN low part: {e}")))?;
 
     Ok((high << 32) | low)
@@ -236,7 +260,7 @@ pub enum ReplicaIdentity {
     /// Default replica identity (primary key)
     Default,
 
-    /// No replica identity  
+    /// No replica identity
     Nothing,
 
     /// Full replica identity (all columns)
@@ -328,8 +352,8 @@ impl SlotType {
     }
 }
 
-impl std::fmt::Display for SlotType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for SlotType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.as_str())
     }
 }
@@ -443,7 +467,7 @@ impl Lsn {
 }
 
 /// Parse LSN from PostgreSQL string format (e.g., "16/B374D848")
-impl std::str::FromStr for Lsn {
+impl core::str::FromStr for Lsn {
     type Err = ReplicationError;
 
     fn from_str(s: &str) -> Result<Self> {
@@ -451,8 +475,8 @@ impl std::str::FromStr for Lsn {
     }
 }
 
-impl std::fmt::Display for Lsn {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Lsn {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", format_lsn(self.0))
     }
 }
@@ -476,14 +500,23 @@ pub enum EventType {
         schema: String,
         table: String,
         relation_oid: u32,
-        data: std::collections::HashMap<String, serde_json::Value>,
+        #[cfg(feature = "std")]
+        data: HashMap<String, serde_json::Value>,
+        #[cfg(not(feature = "std"))]
+        data: BTreeMap<String, serde_json::Value>,
     },
     Update {
         schema: String,
         table: String,
         relation_oid: u32,
-        old_data: Option<std::collections::HashMap<String, serde_json::Value>>,
-        new_data: std::collections::HashMap<String, serde_json::Value>,
+        #[cfg(feature = "std")]
+        old_data: Option<HashMap<String, serde_json::Value>>,
+        #[cfg(not(feature = "std"))]
+        old_data: Option<BTreeMap<String, serde_json::Value>>,
+        #[cfg(feature = "std")]
+        new_data: HashMap<String, serde_json::Value>,
+        #[cfg(not(feature = "std"))]
+        new_data: BTreeMap<String, serde_json::Value>,
         replica_identity: ReplicaIdentity,
         key_columns: Vec<String>,
     },
@@ -491,7 +524,10 @@ pub enum EventType {
         schema: String,
         table: String,
         relation_oid: u32,
-        old_data: std::collections::HashMap<String, serde_json::Value>,
+        #[cfg(feature = "std")]
+        old_data: HashMap<String, serde_json::Value>,
+        #[cfg(not(feature = "std"))]
+        old_data: BTreeMap<String, serde_json::Value>,
         replica_identity: ReplicaIdentity,
         key_columns: Vec<String>,
     },
@@ -499,10 +535,16 @@ pub enum EventType {
     Begin {
         transaction_id: u32,
         final_lsn: Lsn,
+        #[cfg(feature = "std")]
         commit_timestamp: chrono::DateTime<chrono::Utc>,
+        #[cfg(not(feature = "std"))]
+        commit_timestamp: i64,
     },
     Commit {
+        #[cfg(feature = "std")]
         commit_timestamp: chrono::DateTime<chrono::Utc>,
+        #[cfg(not(feature = "std"))]
+        commit_timestamp: i64,
         commit_lsn: Lsn,
         end_lsn: Lsn,
     },
@@ -518,14 +560,20 @@ pub enum EventType {
         transaction_id: u32,
         commit_lsn: Lsn,
         end_lsn: Lsn,
+        #[cfg(feature = "std")]
         commit_timestamp: chrono::DateTime<chrono::Utc>,
+        #[cfg(not(feature = "std"))]
+        commit_timestamp: i64,
     },
     /// Streaming transaction abort
     StreamAbort {
         transaction_id: u32,
         subtransaction_xid: u32,
         abort_lsn: Option<Lsn>,
+        #[cfg(feature = "std")]
         abort_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+        #[cfg(not(feature = "std"))]
+        abort_timestamp: Option<i64>,
     },
     Relation,
     Type,
@@ -543,7 +591,10 @@ pub struct ChangeEvent {
     pub lsn: Lsn,
 
     /// Additional metadata
-    pub metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
+    #[cfg(feature = "std")]
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
+    #[cfg(not(feature = "std"))]
+    pub metadata: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 impl ChangeEvent {
@@ -556,30 +607,33 @@ impl ChangeEvent {
     /// * `relation_oid` - PostgreSQL relation OID
     /// * `data` - Inserted row data as column_name -> value map
     /// * `lsn` - Log Sequence Number for this event
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use pg_walstream::{ChangeEvent, Lsn};
-    /// use std::collections::HashMap;
-    ///
-    /// let mut data = HashMap::new();
-    /// data.insert("id".to_string(), serde_json::json!(1));
-    /// data.insert("name".to_string(), serde_json::json!("Alice"));
-    ///
-    /// let event = ChangeEvent::insert(
-    ///     "public".to_string(),
-    ///     "users".to_string(),
-    ///     12345,
-    ///     data,
-    ///     Lsn::new(0x16B374D848),
-    /// );
-    /// ```
+    #[cfg(feature = "std")]
     pub fn insert(
         schema_name: String,
         table_name: String,
         relation_oid: u32,
-        data: std::collections::HashMap<String, serde_json::Value>,
+        data: HashMap<String, serde_json::Value>,
+        lsn: Lsn,
+    ) -> Self {
+        Self {
+            event_type: EventType::Insert {
+                schema: schema_name,
+                table: table_name,
+                relation_oid,
+                data,
+            },
+            lsn,
+            metadata: None,
+        }
+    }
+
+    /// Create a new INSERT event (no_std version)
+    #[cfg(not(feature = "std"))]
+    pub fn insert(
+        schema_name: String,
+        table_name: String,
+        relation_oid: u32,
+        data: BTreeMap<String, serde_json::Value>,
         lsn: Lsn,
     ) -> Self {
         Self {
@@ -595,50 +649,42 @@ impl ChangeEvent {
     }
 
     /// Create a new UPDATE event
-    ///
-    /// # Arguments
-    ///
-    /// * `schema_name` - Database schema name
-    /// * `table_name` - Table name
-    /// * `relation_oid` - PostgreSQL relation OID
-    /// * `old_data` - Previous row data (may be None depending on replica identity)
-    /// * `new_data` - New row data after update
-    /// * `replica_identity` - Table's replica identity setting (affects old_data availability)
-    /// * `key_columns` - Names of columns that form the replica identity key
-    /// * `lsn` - Log Sequence Number for this event
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use pg_walstream::{ChangeEvent, ReplicaIdentity, Lsn};
-    /// use std::collections::HashMap;
-    ///
-    /// let mut old_data = HashMap::new();
-    /// old_data.insert("id".to_string(), serde_json::json!(1));
-    /// old_data.insert("name".to_string(), serde_json::json!("Alice"));
-    ///
-    /// let mut new_data = HashMap::new();
-    /// new_data.insert("id".to_string(), serde_json::json!(1));
-    /// new_data.insert("name".to_string(), serde_json::json!("Bob"));
-    ///
-    /// let event = ChangeEvent::update(
-    ///     "public".to_string(),
-    ///     "users".to_string(),
-    ///     12345,
-    ///     Some(old_data),
-    ///     new_data,
-    ///     ReplicaIdentity::Default,
-    ///     vec!["id".to_string()],
-    ///     Lsn::new(0x16B374D848),
-    /// );
-    /// ```
+    #[cfg(feature = "std")]
     #[allow(clippy::too_many_arguments)] // Configuration constructor - parameters are all necessary
     pub fn update(
         schema_name: String,
         table_name: String,
         relation_oid: u32,
-        old_data: Option<std::collections::HashMap<String, serde_json::Value>>,
-        new_data: std::collections::HashMap<String, serde_json::Value>,
+        old_data: Option<HashMap<String, serde_json::Value>>,
+        new_data: HashMap<String, serde_json::Value>,
+        replica_identity: ReplicaIdentity,
+        key_columns: Vec<String>,
+        lsn: Lsn,
+    ) -> Self {
+        Self {
+            event_type: EventType::Update {
+                schema: schema_name,
+                table: table_name,
+                relation_oid,
+                old_data,
+                new_data,
+                replica_identity,
+                key_columns,
+            },
+            lsn,
+            metadata: None,
+        }
+    }
+
+    /// Create a new UPDATE event (no_std version)
+    #[cfg(not(feature = "std"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(
+        schema_name: String,
+        table_name: String,
+        relation_oid: u32,
+        old_data: Option<BTreeMap<String, serde_json::Value>>,
+        new_data: BTreeMap<String, serde_json::Value>,
         replica_identity: ReplicaIdentity,
         key_columns: Vec<String>,
         lsn: Lsn,
@@ -659,42 +705,37 @@ impl ChangeEvent {
     }
 
     /// Create a new DELETE event
-    ///
-    /// # Arguments
-    ///
-    /// * `schema_name` - Database schema name
-    /// * `table_name` - Table name
-    /// * `relation_oid` - PostgreSQL relation OID
-    /// * `old_data` - Deleted row data (columns available depend on replica identity)
-    /// * `replica_identity` - Table's replica identity setting
-    /// * `key_columns` - Names of columns that form the replica identity key
-    /// * `lsn` - Log Sequence Number for this event
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use pg_walstream::{ChangeEvent, ReplicaIdentity, Lsn};
-    /// use std::collections::HashMap;
-    ///
-    /// let mut old_data = HashMap::new();
-    /// old_data.insert("id".to_string(), serde_json::json!(1));
-    /// old_data.insert("name".to_string(), serde_json::json!("Alice"));
-    ///
-    /// let event = ChangeEvent::delete(
-    ///     "public".to_string(),
-    ///     "users".to_string(),
-    ///     12345,
-    ///     old_data,
-    ///     ReplicaIdentity::Full,
-    ///     vec!["id".to_string()],
-    ///     Lsn::new(0x16B374D848),
-    /// );
-    /// ```
+    #[cfg(feature = "std")]
     pub fn delete(
         schema_name: String,
         table_name: String,
         relation_oid: u32,
-        old_data: std::collections::HashMap<String, serde_json::Value>,
+        old_data: HashMap<String, serde_json::Value>,
+        replica_identity: ReplicaIdentity,
+        key_columns: Vec<String>,
+        lsn: Lsn,
+    ) -> Self {
+        Self {
+            event_type: EventType::Delete {
+                schema: schema_name,
+                table: table_name,
+                relation_oid,
+                old_data,
+                replica_identity,
+                key_columns,
+            },
+            lsn,
+            metadata: None,
+        }
+    }
+
+    /// Create a new DELETE event (no_std version)
+    #[cfg(not(feature = "std"))]
+    pub fn delete(
+        schema_name: String,
+        table_name: String,
+        relation_oid: u32,
+        old_data: BTreeMap<String, serde_json::Value>,
         replica_identity: ReplicaIdentity,
         key_columns: Vec<String>,
         lsn: Lsn,
@@ -714,15 +755,7 @@ impl ChangeEvent {
     }
 
     /// Create a BEGIN transaction event
-    ///
-    /// Marks the beginning of a transaction in the replication stream.
-    ///
-    /// # Arguments
-    ///
-    /// * `transaction_id` - PostgreSQL transaction ID (XID)
-    /// * `final_lsn` - The final LSN of the transaction
-    /// * `commit_timestamp` - Transaction start timestamp
-    /// * `lsn` - Log Sequence Number for this event
+    #[cfg(feature = "std")]
     pub fn begin(
         transaction_id: u32,
         final_lsn: Lsn,
@@ -740,14 +773,22 @@ impl ChangeEvent {
         }
     }
 
+    /// Create a BEGIN transaction event (no_std version - timestamp as i64)
+    #[cfg(not(feature = "std"))]
+    pub fn begin(transaction_id: u32, final_lsn: Lsn, commit_timestamp: i64, lsn: Lsn) -> Self {
+        Self {
+            event_type: EventType::Begin {
+                transaction_id,
+                final_lsn,
+                commit_timestamp,
+            },
+            lsn,
+            metadata: None,
+        }
+    }
+
     /// Create a COMMIT transaction event
-    ///
-    /// Marks the successful commit of a transaction in the replication stream.
-    ///
-    /// # Arguments
-    ///
-    /// * `commit_timestamp` - Transaction commit timestamp
-    /// * `lsn` - Log Sequence Number for this event
+    #[cfg(feature = "std")]
     pub fn commit(
         commit_timestamp: chrono::DateTime<chrono::Utc>,
         lsn: Lsn,
@@ -765,12 +806,21 @@ impl ChangeEvent {
         }
     }
 
+    /// Create a COMMIT transaction event (no_std version)
+    #[cfg(not(feature = "std"))]
+    pub fn commit(commit_timestamp: i64, lsn: Lsn, commit_lsn: Lsn, end_lsn: Lsn) -> Self {
+        Self {
+            event_type: EventType::Commit {
+                commit_timestamp,
+                commit_lsn,
+                end_lsn,
+            },
+            lsn,
+            metadata: None,
+        }
+    }
+
     /// Create a TRUNCATE event
-    ///
-    /// # Arguments
-    ///
-    /// * `tables` - List of table names that were truncated
-    /// * `lsn` - Log Sequence Number for this event
     pub fn truncate(tables: Vec<String>, lsn: Lsn) -> Self {
         Self {
             event_type: EventType::Truncate(tables),
@@ -780,10 +830,6 @@ impl ChangeEvent {
     }
 
     /// Create a RELATION event
-    ///
-    /// # Arguments
-    ///
-    /// * `lsn` - Log Sequence Number for this event
     pub fn relation(lsn: Lsn) -> Self {
         Self {
             event_type: EventType::Relation,
@@ -793,10 +839,6 @@ impl ChangeEvent {
     }
 
     /// Create a TYPE event
-    ///
-    /// # Arguments
-    ///
-    /// * `lsn` - Log Sequence Number for this event
     pub fn type_event(lsn: Lsn) -> Self {
         Self {
             event_type: EventType::Type,
@@ -806,10 +848,6 @@ impl ChangeEvent {
     }
 
     /// Create an ORIGIN event
-    ///
-    /// # Arguments
-    ///
-    /// * `lsn` - Log Sequence Number for this event
     pub fn origin(lsn: Lsn) -> Self {
         Self {
             event_type: EventType::Origin,
@@ -819,10 +857,6 @@ impl ChangeEvent {
     }
 
     /// Create a MESSAGE event
-    ///
-    /// # Arguments
-    ///
-    /// * `lsn` - Log Sequence Number for this event
     pub fn message(lsn: Lsn) -> Self {
         Self {
             event_type: EventType::Message,
@@ -832,10 +866,15 @@ impl ChangeEvent {
     }
 
     /// Set metadata for this event
-    pub fn with_metadata(
-        mut self,
-        metadata: std::collections::HashMap<String, serde_json::Value>,
-    ) -> Self {
+    #[cfg(feature = "std")]
+    pub fn with_metadata(mut self, metadata: HashMap<String, serde_json::Value>) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    /// Set metadata for this event (no_std version)
+    #[cfg(not(feature = "std"))]
+    pub fn with_metadata(mut self, metadata: BTreeMap<String, serde_json::Value>) -> Self {
         self.metadata = Some(metadata);
         self
     }
@@ -876,8 +915,6 @@ impl ChangeEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_cache_padded_deref_and_mut() {
@@ -890,7 +927,7 @@ mod tests {
     #[test]
     fn test_cache_padded_alignment() {
         let padded = CachePadded::new(0u8);
-        let addr = (&*padded as *const u8 as usize) % std::mem::align_of::<CachePadded<u8>>();
+        let addr = (&*padded as *const u8 as usize) % core::mem::align_of::<CachePadded<u8>>();
         assert_eq!(addr, 0);
     }
 
@@ -907,15 +944,19 @@ mod tests {
         assert_eq!(format_lsn(0x100000000 + 0x12345678), "1/12345678");
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_postgres_epoch() {
+        use chrono::{TimeZone, Utc};
         let ts = 0; // PostgreSQL epoch (2000-01-01 UTC)
         let dt = postgres_timestamp_to_chrono(ts);
         assert_eq!(dt, Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap());
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_unix_epoch() {
+        use chrono::{TimeZone, Utc};
         let unix_epoch = UNIX_EPOCH;
         let pg_ts = system_time_to_postgres_timestamp(unix_epoch);
 
@@ -924,8 +965,10 @@ mod tests {
         assert_eq!(dt, Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap());
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_round_trip_now() {
+        use chrono::{TimeZone, Utc};
         let now = SystemTime::now();
         let pg_ts = system_time_to_postgres_timestamp(now);
         let dt = postgres_timestamp_to_chrono(pg_ts);
@@ -941,6 +984,7 @@ mod tests {
         assert!(diff < 2, "Round trip difference too large: {diff}");
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_format_postgres_timestamp() {
         let ts = 0; // PostgreSQL epoch
@@ -1028,9 +1072,10 @@ mod tests {
         assert_eq!(lsn1, lsn1);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_change_event_insert() {
-        let mut data = std::collections::HashMap::new();
+        let mut data = HashMap::new();
         data.insert("id".to_string(), serde_json::json!(1));
         data.insert("name".to_string(), serde_json::json!("test"));
 

@@ -5,16 +5,26 @@
 //!
 //! The PostgreSQL replication protocol expects three different LSN values:
 //! - `write_lsn`: Data received from the stream
-//! - `flush_lsn`: Data written to destination (before commit)  
+//! - `flush_lsn`: Data written to destination (before commit)
 //! - `replay_lsn`: Data committed to destination
 //!
 //! Since the producer reads from PostgreSQL and the consumer writes to the destination,
 //! we need a thread-safe way to share the committed LSN from consumer back to producer
 //! for accurate feedback to PostgreSQL.
 
-use crate::types::{format_lsn, CachePadded, XLogRecPtr};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "std")]
 use std::sync::Arc;
+
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
+
+use crate::types::{CachePadded, XLogRecPtr};
+use core::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(feature = "std")]
+use crate::types::format_lsn;
+
+#[cfg(feature = "std")]
 use tracing::{debug, info};
 
 /// Thread-safe tracker for LSN positions used in replication feedback
@@ -33,7 +43,7 @@ use tracing::{debug, info};
 /// // Consumer updates LSN after flushing data
 /// feedback.update_flushed_lsn(1000);
 ///
-/// // Consumer updates LSN after committing transaction  
+/// // Consumer updates LSN after committing transaction
 /// feedback.update_applied_lsn(1000);
 ///
 /// // Producer reads LSN values for feedback to PostgreSQL
@@ -119,6 +129,7 @@ impl SharedLsnFeedback {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    #[cfg(feature = "std")]
                     debug!(
                         "SharedLsnFeedback: Updated flushed LSN from {} to {}",
                         current, lsn
@@ -152,6 +163,7 @@ impl SharedLsnFeedback {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    #[cfg(feature = "std")]
                     debug!(
                         "SharedLsnFeedback: Updated applied LSN from {} to {}",
                         current, lsn
@@ -223,6 +235,7 @@ impl SharedLsnFeedback {
     }
 
     /// Log current LSN state (for debugging)
+    #[cfg(feature = "std")]
     pub fn log_state(&self, prefix: &str) {
         let flushed = self.get_flushed_lsn();
         let applied = self.get_applied_lsn();
@@ -340,13 +353,13 @@ mod tests {
         assert_eq!(feedback_clone.get_applied_lsn(), 100);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_concurrent_updates() {
-        use std::sync::Arc;
         use std::thread;
 
         let feedback = SharedLsnFeedback::new_shared();
-        let mut handles = vec![];
+        let mut handles = Vec::new();
 
         // Spawn multiple threads updating LSNs concurrently
         for i in 0..10 {

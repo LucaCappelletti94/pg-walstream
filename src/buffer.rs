@@ -3,6 +3,16 @@
 //! This module provides safe wrappers for reading and writing binary data
 //! in PostgreSQL's logical replication protocol format using the bytes crate.
 
+#[cfg(not(feature = "std"))]
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+
+#[cfg(feature = "std")]
+use std::string::String;
+
 use crate::error::{ReplicationError, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -369,7 +379,7 @@ impl BufferWriter {
         self.data.capacity()
     }
 
-    /// Get a reference to the internal data  
+    /// Get a reference to the internal data
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }

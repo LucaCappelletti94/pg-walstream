@@ -3,62 +3,107 @@
 //! This module provides error types specifically for replication protocol
 //! operations, connection handling, and message parsing.
 
-use thiserror::Error;
+#[cfg(not(feature = "std"))]
+use alloc::string::String;
+
+use core::fmt;
 
 /// Comprehensive error types for replication operations
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum ReplicationError {
     /// Protocol parsing errors
-    #[error("Protocol parsing error: {0}")]
     Protocol(String),
 
     /// Buffer operation errors
-    #[error("Buffer error: {0}")]
     Buffer(String),
 
     /// Connection errors that can be retried (transient)
-    #[error("Transient connection error: {0}")]
     TransientConnection(String),
 
     /// Connection errors that should not be retried (permanent)
-    #[error("Permanent connection error: {0}")]
     PermanentConnection(String),
 
     /// Replication connection errors
-    #[error("Replication connection error: {0}")]
     ReplicationConnection(String),
 
     /// Authentication errors
-    #[error("Authentication failed: {0}")]
     Authentication(String),
 
     /// Replication slot errors
-    #[error("Replication slot error: {0}")]
     ReplicationSlot(String),
 
     /// Timeout errors
-    #[error("Operation timed out: {0}")]
     Timeout(String),
 
     /// Operation cancelled errors
-    #[error("Operation was cancelled: {0}")]
     Cancelled(String),
 
     /// Configuration errors
-    #[error("Configuration error: {0}")]
     Config(String),
 
-    /// IO errors
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    /// IO errors (std only)
+    #[cfg(feature = "std")]
+    Io(std::io::Error),
 
-    /// String conversion errors (from CString operations)
-    #[error("String conversion error: {0}")]
-    StringConversion(#[from] std::ffi::NulError),
+    /// String conversion errors from CString operations (std only)
+    #[cfg(feature = "std")]
+    StringConversion(std::ffi::NulError),
 
     /// Generic replication errors
-    #[error("Replication error: {0}")]
     Generic(String),
+}
+
+impl fmt::Display for ReplicationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReplicationError::Protocol(msg) => write!(f, "Protocol parsing error: {}", msg),
+            ReplicationError::Buffer(msg) => write!(f, "Buffer error: {}", msg),
+            ReplicationError::TransientConnection(msg) => {
+                write!(f, "Transient connection error: {}", msg)
+            }
+            ReplicationError::PermanentConnection(msg) => {
+                write!(f, "Permanent connection error: {}", msg)
+            }
+            ReplicationError::ReplicationConnection(msg) => {
+                write!(f, "Replication connection error: {}", msg)
+            }
+            ReplicationError::Authentication(msg) => write!(f, "Authentication failed: {}", msg),
+            ReplicationError::ReplicationSlot(msg) => write!(f, "Replication slot error: {}", msg),
+            ReplicationError::Timeout(msg) => write!(f, "Operation timed out: {}", msg),
+            ReplicationError::Cancelled(msg) => write!(f, "Operation was cancelled: {}", msg),
+            ReplicationError::Config(msg) => write!(f, "Configuration error: {}", msg),
+            #[cfg(feature = "std")]
+            ReplicationError::Io(e) => write!(f, "IO error: {}", e),
+            #[cfg(feature = "std")]
+            ReplicationError::StringConversion(e) => write!(f, "String conversion error: {}", e),
+            ReplicationError::Generic(msg) => write!(f, "Replication error: {}", msg),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ReplicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ReplicationError::Io(e) => Some(e),
+            ReplicationError::StringConversion(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<std::io::Error> for ReplicationError {
+    fn from(err: std::io::Error) -> Self {
+        ReplicationError::Io(err)
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<std::ffi::NulError> for ReplicationError {
+    fn from(err: std::ffi::NulError) -> Self {
+        ReplicationError::StringConversion(err)
+    }
 }
 
 impl ReplicationError {
@@ -124,13 +169,14 @@ impl ReplicationError {
 
     /// Check if the error is transient (can be retried)
     pub fn is_transient(&self) -> bool {
-        matches!(
-            self,
+        match self {
             ReplicationError::TransientConnection(_)
-                | ReplicationError::Timeout(_)
-                | ReplicationError::Io(_)
-                | ReplicationError::ReplicationConnection(_)
-        )
+            | ReplicationError::Timeout(_)
+            | ReplicationError::ReplicationConnection(_) => true,
+            #[cfg(feature = "std")]
+            ReplicationError::Io(_) => true,
+            _ => false,
+        }
     }
 
     /// Check if the error is permanent (should not be retried)
@@ -150,7 +196,7 @@ impl ReplicationError {
 }
 
 /// Result type for replication operations
-pub type Result<T> = std::result::Result<T, ReplicationError>;
+pub type Result<T> = core::result::Result<T, ReplicationError>;
 
 #[cfg(test)]
 mod tests {
@@ -242,6 +288,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_io_error_conversion() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
@@ -253,6 +300,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_nul_error_conversion() {
         let nul_err = std::ffi::CString::new("hello\0world").unwrap_err();

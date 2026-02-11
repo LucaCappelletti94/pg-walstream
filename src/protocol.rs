@@ -5,17 +5,51 @@
 //! - <https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html>
 //! - <https://www.postgresql.org/docs/current/protocol-logical-replication.html>
 
-use crate::buffer::{BufferReader, BufferWriter};
-use crate::error::{ReplicationError, Result};
-use crate::types::{
-    format_lsn, system_time_to_postgres_timestamp, Oid, TimestampTz, XLogRecPtr, Xid,
+#[cfg(not(feature = "std"))]
+use alloc::{
+    borrow::Cow,
+    format,
+    string::{String, ToString},
+    vec::Vec,
 };
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "std")]
 use std::borrow::Cow;
+
+#[cfg(feature = "std")]
 use std::collections::HashMap;
+
+#[cfg(not(feature = "std"))]
+use hashbrown::HashMap;
+
+use crate::buffer::BufferReader;
+use crate::error::{ReplicationError, Result};
+use crate::types::{Oid, TimestampTz, XLogRecPtr, Xid};
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "std")]
+use crate::buffer::BufferWriter;
+
+#[cfg(feature = "std")]
+use crate::types::format_lsn;
+
+#[cfg(feature = "std")]
+use bytes::Bytes;
+
+#[cfg(feature = "std")]
+use crate::types::system_time_to_postgres_timestamp;
+
+#[cfg(feature = "std")]
 use std::time::SystemTime;
+
+#[cfg(feature = "std")]
 use tracing::debug;
+
+// Conditional debug macro for no_std
+#[cfg(not(feature = "std"))]
+macro_rules! debug {
+    ($($arg:tt)*) => {};
+}
 
 /// Message type constants for logical replication protocol
 pub mod message_types {
@@ -388,7 +422,7 @@ impl ColumnData {
             return None;
         }
 
-        match std::str::from_utf8(&self.data) {
+        match core::str::from_utf8(&self.data) {
             Ok(s) => Some(Cow::Borrowed(s)),
             Err(_) => {
                 // Fallback: Use lossy conversion (rare case)
@@ -493,7 +527,7 @@ impl StreamingReplicationMessage {
     }
 }
 
-/// State for managing replication relations and tracking
+/// State for managing replication relations and tracking (std only)
 ///
 /// # LSN Tracking
 ///
@@ -512,6 +546,7 @@ impl StreamingReplicationMessage {
 /// 1. Know which WAL can be recycled (based on replay_lsn)
 /// 2. Calculate replication lag (sent_lsn - replay_lsn)
 /// 3. Decide when to send keepalive messages
+#[cfg(feature = "std")]
 #[derive(Debug)]
 pub struct ReplicationState {
     /// Relations by OID
@@ -529,6 +564,7 @@ pub struct ReplicationState {
     last_sent_applied_lsn: XLogRecPtr,
 }
 
+#[cfg(feature = "std")]
 impl ReplicationState {
     #[inline]
     pub fn new() -> Self {
@@ -607,6 +643,7 @@ impl ReplicationState {
     }
 }
 
+#[cfg(feature = "std")]
 impl Default for ReplicationState {
     fn default() -> Self {
         Self::new()
@@ -773,6 +810,7 @@ impl LogicalReplicationParser {
         );
 
         let mut columns = Vec::with_capacity(column_count as usize);
+        #[allow(unused_variables)]
         for i in 0..column_count {
             let flags = reader.read_u8()?;
             let name = reader.read_cstring()?;
@@ -1320,7 +1358,7 @@ pub struct KeepaliveMessage {
 ///
 /// * `xmin` - Oldest transaction ID still considered active
 /// * `xmin_epoch` - Epoch for xmin
-/// * `catalog_xmin` - Oldest transaction ID affecting catalog still considered active  
+/// * `catalog_xmin` - Oldest transaction ID affecting catalog still considered active
 /// * `catalog_xmin_epoch` - Epoch for catalog_xmin
 ///
 /// # Returns
@@ -1336,6 +1374,7 @@ pub struct KeepaliveMessage {
 /// - Int32: xmin epoch
 /// - Int32: catalog_xmin
 /// - Int32: catalog_xmin epoch
+#[cfg(feature = "std")]
 pub fn build_hot_standby_feedback_message(
     xmin: u32,
     xmin_epoch: u32,
@@ -1390,6 +1429,7 @@ mod tests {
         assert_eq!(relation.get_key_columns()[0].name, "id");
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_replication_state() {
         let mut state = ReplicationState::new();
@@ -1811,6 +1851,7 @@ mod tests {
         assert_eq!(str_ref, "hello");
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_replication_state_lsn_updates() {
         let mut state = ReplicationState::new();
