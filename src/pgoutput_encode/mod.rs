@@ -21,6 +21,13 @@ use bytes::BytesMut;
 
 /// Append `msg` as `pgoutput` wire bytes to `buf`. Infallible for any
 /// parser-produced value.
+///
+/// The message must be well formed: CString fields (relation and column names,
+/// GID, origin name, message prefix) must not contain interior NUL bytes, and
+/// each column payload must be at most `u32::MAX` bytes. Every
+/// `LogicalReplicationMessage` produced by `LogicalReplicationParser` or emitted
+/// by PostgreSQL satisfies this. Violations trip a `debug_assert` in debug and
+/// test builds.
 pub fn encode_message(msg: &LogicalReplicationMessage, protocol_version: u8, buf: &mut BytesMut) {
     use LogicalReplicationMessage as M;
 
