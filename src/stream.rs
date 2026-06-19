@@ -2179,6 +2179,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_feedback_check_interval_is_power_of_two() {
         // The hot-path gate folds `counter % INTERVAL` into a bitmask via
         // `counter & (INTERVAL - 1)`, which is only correct when INTERVAL
@@ -2219,6 +2220,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_health_check_event_interval_is_power_of_two() {
         // `next_event_with_retry` uses the same `counter & (INTERVAL - 1) == 0`
         // bitmask trick to gate `Instant::now()` calls, so HEALTH_CHECK_EVENT_INTERVAL
@@ -2232,6 +2234,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_health_check_event_interval_at_least_feedback_interval() {
         // The health check interval is intentionally coarser than the feedback
         // interval (and is a multiple of it) so feedback never gets starved by

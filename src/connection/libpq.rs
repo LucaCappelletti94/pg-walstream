@@ -665,8 +665,7 @@ impl PgReplicationConnection {
     /// # Arguments
     ///
     /// * `slot_name` - Name of the replication slot to drop
-    /// * `wait` - If true, the command waits until the slot becomes inactive
-    ///            instead of returning an error when the slot is in use
+    /// * `wait` - If true, the command waits until the slot becomes inactive instead of returning an error when the slot is in use
     pub fn drop_replication_slot(&mut self, slot_name: &str, wait: bool) -> Result<()> {
         let sql = Self::build_drop_slot_sql(slot_name, wait)?;
 

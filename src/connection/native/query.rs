@@ -90,7 +90,6 @@ pub async fn simple_query<S: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::BufMut;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
