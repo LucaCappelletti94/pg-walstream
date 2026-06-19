@@ -51,6 +51,10 @@ const TLS_BUF_SIZE: usize = 16_384;
 ///
 /// The TLS variant wraps the `TlsStream` in a `BufReader` to reduce read
 /// syscall frequency during high-throughput WAL streaming.
+// One Transport per connection on the I/O hot path. Boxing the Tls variant to
+// satisfy large_enum_variant would add a pointer indirection to every read and
+// write, so the size gap is an intentional tradeoff.
+#[allow(clippy::large_enum_variant)]
 pub enum Transport {
     Plain(TcpStream),
     Tls(BufReader<tokio_rustls::client::TlsStream<TcpStream>>),
@@ -864,7 +868,7 @@ mod tests {
         let store = build_root_store(Some(pem_path.to_str().unwrap())).unwrap();
         // Should contain ONLY the certs from our file, not the Mozilla bundle
         assert!(
-            store.len() >= 1,
+            !store.is_empty(),
             "Expected at least 1 CA from custom file, got {}",
             store.len()
         );

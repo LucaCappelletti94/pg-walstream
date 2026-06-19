@@ -394,7 +394,7 @@ mod tests {
         // Pre-load a message with body_len exceeding MAX_MESSAGE_LEN (128 MiB)
         let huge_len: i32 = (MAX_MESSAGE_LEN as i32) + 1;
         let mut buf = BytesMut::new();
-        buf.extend_from_slice(&[b'Z']);
+        buf.extend_from_slice(b"Z");
         buf.extend_from_slice(&huge_len.to_be_bytes());
 
         let result = read_message(&mut client, &mut buf).await;
@@ -414,7 +414,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
 
         tokio::spawn(async move {
-            server.write_all(&[b'S']).await.unwrap();
+            server.write_all(b"S").await.unwrap();
             server.flush().await.unwrap();
         });
 

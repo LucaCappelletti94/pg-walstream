@@ -118,6 +118,10 @@ pub enum MessageType {
 
 /// Unified logical replication message enum
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Parsed once per message on the hot path. Boxing the tuple variants to satisfy
+// large_enum_variant would add a per-message heap allocation, so the size gap is
+// an intentional tradeoff for the zero-copy path.
+#[allow(clippy::large_enum_variant)]
 pub enum LogicalReplicationMessage {
     /// Begin transaction
     Begin {

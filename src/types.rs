@@ -472,6 +472,10 @@ pub use crate::column_value::{ColumnValue, RowData};
 
 /// Represents the type of change event from PostgreSQL logical replication
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Built once per change on the hot path. Boxing the data variants to satisfy
+// large_enum_variant would add a per-row heap allocation, so the size gap is an
+// intentional tradeoff for the allocation-free path.
+#[allow(clippy::large_enum_variant)]
 pub enum EventType {
     Insert {
         schema: Arc<str>,
@@ -2900,8 +2904,7 @@ mod tests {
             ReplicaIdentity::Index,
         ] {
             let new = RowData::from_pairs(vec![("x", ColumnValue::text("1"))]);
-            let event =
-                ChangeEvent::update("s", "t", 1, None, new, ri.clone(), vec![], Lsn::new(12000));
+            let event = ChangeEvent::update("s", "t", 1, None, new, ri, vec![], Lsn::new(12000));
             assert_encode_decode_round_trip(&event);
         }
     }
@@ -2915,15 +2918,8 @@ mod tests {
             ReplicaIdentity::Index,
         ] {
             let old = RowData::from_pairs(vec![("k", ColumnValue::text("v"))]);
-            let event = ChangeEvent::delete(
-                "s",
-                "t",
-                1,
-                old,
-                ri.clone(),
-                vec![Arc::from("k")],
-                Lsn::new(13000),
-            );
+            let event =
+                ChangeEvent::delete("s", "t", 1, old, ri, vec![Arc::from("k")], Lsn::new(13000));
             assert_encode_decode_round_trip(&event);
         }
     }
@@ -3003,6 +2999,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
     fn test_replica_identity_debug_clone() {
         let ri = ReplicaIdentity::Full;
         let cloned = ri.clone();
@@ -3013,7 +3010,7 @@ mod tests {
 
     #[test]
     fn test_replica_identity_round_trip_byte() {
-        for byte in [b'd', b'n', b'f', b'i'] {
+        for &byte in b"dnfi" {
             let ri = ReplicaIdentity::from_byte(byte).unwrap();
             assert_eq!(ri.to_byte(), byte);
         }
