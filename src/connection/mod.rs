@@ -16,12 +16,6 @@
 //! Both backends expose the same public types: `PgReplicationConnection` and
 //! `PgResult`.
 
-#[cfg(not(any(feature = "libpq", feature = "rustls-tls")))]
-compile_error!(
-    "Either the `libpq` or `rustls-tls` feature must be enabled. \
-     Example: --features libpq"
-);
-
 // ── libpq backend (default) ──────────────────────────────────────────────────
 
 #[cfg(all(feature = "libpq", not(feature = "rustls-tls")))]

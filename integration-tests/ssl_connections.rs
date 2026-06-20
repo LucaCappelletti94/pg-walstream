@@ -1,3 +1,5 @@
+#![cfg(any(feature = "libpq", feature = "rustls-tls"))]
+
 //! Integration tests for SSL/TLS connection modes.
 //!
 //! These tests verify that the rustls-tls backend correctly handles different
