@@ -1,3 +1,5 @@
+#![cfg(any(feature = "libpq", feature = "rustls-tls"))]
+
 //! Integration tests for the safe transaction consumer pattern.
 //!
 //! These tests verify the transaction-buffered consumption pattern

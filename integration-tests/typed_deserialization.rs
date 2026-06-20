@@ -1,3 +1,5 @@
+#![cfg(any(feature = "libpq", feature = "rustls-tls"))]
+
 //! Integration tests for the typed deserialization API end-to-end through
 //! pgoutput logical replication.
 //!

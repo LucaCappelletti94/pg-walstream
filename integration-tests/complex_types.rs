@@ -1,3 +1,5 @@
+#![cfg(any(feature = "libpq", feature = "rustls-tls"))]
+
 //! Integration tests for complex PostgreSQL data types through logical replication.
 //!
 //! These tests verify that the library correctly streams and represents complex

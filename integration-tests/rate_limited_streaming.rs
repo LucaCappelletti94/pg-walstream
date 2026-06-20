@@ -1,3 +1,5 @@
+#![cfg(any(feature = "libpq", feature = "rustls-tls"))]
+
 //! Integration tests for the rate-limited streaming pattern.
 //!
 //! These tests verify that the `into_stream()` / `EventStream` API works

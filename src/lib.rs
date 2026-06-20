@@ -135,9 +135,12 @@ pub mod lsn;
 pub mod protocol;
 
 // High-level stream management
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub mod stream;
 
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub mod connection;
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub mod retry;
 
 // Re-export main types for convenience
@@ -186,18 +189,22 @@ pub use protocol::{
 };
 
 // Re-export stream types
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub use stream::{
     EventStream, EventStreamRef, LogicalReplicationStream, OriginFilter, ReplicationStreamConfig,
     StreamingMode,
 };
 
 // Re-export tokio_util for CancellationToken
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub use tokio_util::sync::CancellationToken;
 
 // Re-export libpq-specific types
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub use connection::{PgReplicationConnection, PgResult};
 
 // Re-export retry types
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub use retry::{ExponentialBackoff, ReplicationConnectionRetry, RetryConfig};
 
 // Re-export SQL builder utilities

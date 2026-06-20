@@ -13,8 +13,8 @@ keywords = ["postgresql", "replication", "wal", "logical-decoding", "streaming"]
 categories = ["database", "parsing", "network-programming"]
 
 [dependencies]
-tokio = { version = "1.52.3", features = ["io-util", "net", "time", "macros", "rt", "rt-multi-thread"] }
-tokio-util = "0.7.18"
+tokio = { version = "1.52.3", features = ["io-util", "net", "time", "macros", "rt", "rt-multi-thread"], optional = true }
+tokio-util = { version = "0.7.18", optional = true }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 bytes = { version = "1.11.1", features = ["serde"] }
@@ -36,10 +36,12 @@ socket2 = { version = "0.6.4", features = ["all"], optional = true }
 
 [features]
 default = ["libpq"]
-libpq = ["dep:libpq-sys"]
+libpq = ["dep:libpq-sys", "dep:tokio", "dep:tokio-util"]
 
 # Pure-Rust native backend: uses rustls with aws-lc-rs forhardware-accelerated TLS crypto (AES-NI, AVX2, SHA-NI), requires cmake + C compiler at build time.
 rustls-tls = [
+    "dep:tokio",
+    "dep:tokio-util",
     "dep:tokio-rustls",
     "dep:rustls",
     "dep:webpki-roots",

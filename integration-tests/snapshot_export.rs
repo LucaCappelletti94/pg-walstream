@@ -1,3 +1,5 @@
+#![cfg(any(feature = "libpq", feature = "rustls-tls"))]
+
 //! Integration tests for the EXPORT_SNAPSHOT workflow.
 //!
 //! These tests verify the PostgreSQL snapshot lifecycle when using
