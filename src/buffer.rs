@@ -4,6 +4,7 @@
 //! in PostgreSQL's logical replication protocol format using the bytes crate.
 
 use crate::error::{ReplicationError, Result};
+use crate::prelude::*;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Buffer reader for parsing binary protocol messages
@@ -151,7 +152,7 @@ impl BufferReader {
         })?;
 
         // Validate UTF-8 on the borrowed slice (zero-copy), then create one owned String
-        let result = std::str::from_utf8(&data_slice[..bytes_to_read])
+        let result = core::str::from_utf8(&data_slice[..bytes_to_read])
             .map_err(|e| ReplicationError::protocol(format!("Invalid UTF-8 in string: {e}")))?
             .to_owned();
 
@@ -163,17 +164,17 @@ impl BufferReader {
 
     /// Read a null-terminated string directly into `Arc<str>` (avoids intermediate String allocation).
     #[inline]
-    pub fn read_cstring_arc(&mut self) -> Result<std::sync::Arc<str>> {
+    pub fn read_cstring_arc(&mut self) -> Result<Arc<str>> {
         let data_slice = self.data.chunk();
 
         let bytes_to_read = memchr::memchr(0, data_slice).ok_or_else(|| {
             ReplicationError::protocol("Unterminated string in buffer".to_string())
         })?;
 
-        let result = std::str::from_utf8(&data_slice[..bytes_to_read])
+        let result = core::str::from_utf8(&data_slice[..bytes_to_read])
             .map_err(|e| ReplicationError::protocol(format!("Invalid UTF-8 in string: {e}")))?;
 
-        let arc: std::sync::Arc<str> = std::sync::Arc::from(result);
+        let arc: Arc<str> = Arc::from(result);
 
         self.data.advance(bytes_to_read + 1);
 
@@ -184,7 +185,7 @@ impl BufferReader {
     #[inline]
     pub fn read_string(&mut self, length: usize) -> Result<String> {
         self.ensure_bytes(length)?;
-        let result = std::str::from_utf8(&self.data.chunk()[..length])
+        let result = core::str::from_utf8(&self.data.chunk()[..length])
             .map_err(|e| ReplicationError::protocol(format!("Invalid UTF-8 in string: {e}")))?
             .to_owned();
         self.data.advance(length);

@@ -12,9 +12,9 @@
 //! we need a thread-safe way to share the committed LSN from consumer back to producer
 //! for accurate feedback to PostgreSQL.
 
+use crate::prelude::*;
 use crate::types::{format_lsn, CachePadded, XLogRecPtr};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info};
 
 /// Thread-safe tracker for LSN positions used in replication feedback

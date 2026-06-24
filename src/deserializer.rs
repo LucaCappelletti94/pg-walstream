@@ -28,8 +28,8 @@
 
 use crate::column_value::{ColumnValue, RowData};
 use crate::error::ReplicationError;
+use crate::prelude::*;
 use serde::de::{self, DeserializeSeed, MapAccess, Visitor};
-use std::sync::Arc;
 
 /// Parse PostgreSQL's boolean text vocabulary.
 ///
@@ -127,7 +127,7 @@ where
 
 /// Render a byte slice as a string for error messages, lossy on non-UTF-8.
 #[inline]
-fn lossy_token(b: &[u8]) -> std::borrow::Cow<'_, str> {
+fn lossy_token(b: &[u8]) -> Cow<'_, str> {
     String::from_utf8_lossy(b)
 }
 
@@ -189,7 +189,7 @@ impl<'de, 'a> de::Deserializer<'de> for RowDataDeserializer<'a> {
 // ---------------------------------------------------------------------------
 
 struct RowDataMapAccess<'a> {
-    iter: std::slice::Iter<'a, (Arc<str>, ColumnValue)>,
+    iter: core::slice::Iter<'a, (Arc<str>, ColumnValue)>,
     current_value: Option<&'a ColumnValue>,
 }
 
@@ -243,7 +243,7 @@ impl<'a> ColumnValueDeserializer<'a> {
     #[inline]
     fn text_or_err(&self, target: &str) -> Result<&'a str, ReplicationError> {
         match self.value {
-            ColumnValue::Text(b) => std::str::from_utf8(b).map_err(|e| {
+            ColumnValue::Text(b) => core::str::from_utf8(b).map_err(|e| {
                 ReplicationError::deserialize(format!("invalid UTF-8 for {target}: {e}"))
             }),
             ColumnValue::Null => Err(ReplicationError::deserialize(format!(
@@ -273,9 +273,9 @@ impl<'a> ColumnValueDeserializer<'a> {
 
     /// Parse text as a numeric type via the std `FromStr` (used for floats).
     #[inline]
-    fn parse_text<T: std::str::FromStr>(&self, type_name: &str) -> Result<T, ReplicationError>
+    fn parse_text<T: core::str::FromStr>(&self, type_name: &str) -> Result<T, ReplicationError>
     where
-        T::Err: std::fmt::Display,
+        T::Err: core::fmt::Display,
     {
         let s = self.text_or_err(type_name)?;
         s.parse::<T>().map_err(|e| {
@@ -313,7 +313,7 @@ impl<'a> ColumnValueDeserializer<'a> {
 #[cold]
 #[inline(never)]
 fn numeric_parse_error(b: &[u8], type_name: &str) -> ReplicationError {
-    match std::str::from_utf8(b) {
+    match core::str::from_utf8(b) {
         Ok(s) => ReplicationError::deserialize(format!("failed to parse '{s}' as {type_name}")),
         Err(e) => ReplicationError::deserialize(format!("invalid UTF-8 for {type_name}: {e}")),
     }
@@ -326,7 +326,7 @@ impl<'de, 'a> de::Deserializer<'de> for ColumnValueDeserializer<'a> {
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             ColumnValue::Null => visitor.visit_none(),
-            ColumnValue::Text(b) => match std::str::from_utf8(b) {
+            ColumnValue::Text(b) => match core::str::from_utf8(b) {
                 Ok(s) => visitor.visit_str(s),
                 Err(_) => visitor.visit_bytes(b),
             },
@@ -560,8 +560,8 @@ pub struct FieldError {
     pub message: String,
 }
 
-impl std::fmt::Display for FieldError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for FieldError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "field '{}': {}", self.field, self.message)
     }
 }
@@ -588,7 +588,7 @@ impl<T> TryDeserializeResult<T> {
     }
 
     /// Convert into a standard `Result`: `Ok(value)` if no errors, else `Err(errors)`.
-    pub fn into_result(self) -> std::result::Result<T, Vec<FieldError>> {
+    pub fn into_result(self) -> core::result::Result<T, Vec<FieldError>> {
         if self.errors.is_empty() {
             Ok(self.value)
         } else {
@@ -599,13 +599,13 @@ impl<T> TryDeserializeResult<T> {
 
 /// Shared lenient context passed down through the deserializer chain.
 pub(crate) struct LenientCtx {
-    errors: std::cell::RefCell<Vec<FieldError>>,
+    errors: core::cell::RefCell<Vec<FieldError>>,
 }
 
 impl LenientCtx {
     fn new() -> Self {
         Self {
-            errors: std::cell::RefCell::new(Vec::new()),
+            errors: core::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -668,7 +668,7 @@ impl<'de, 'a> de::Deserializer<'de> for LenientRowDataDeserializer<'a> {
 }
 
 struct LenientMapAccess<'a> {
-    iter: std::slice::Iter<'a, (Arc<str>, ColumnValue)>,
+    iter: core::slice::Iter<'a, (Arc<str>, ColumnValue)>,
     current: Option<(&'a str, &'a ColumnValue)>,
     ctx: &'a LenientCtx,
 }
@@ -721,7 +721,7 @@ impl<'a> LenientColumnValueDeserializer<'a> {
     /// Get the text content, recording a field error and returning `None` on failure.
     fn try_text(&self, target: &str) -> Option<&'a str> {
         match self.value {
-            ColumnValue::Text(b) => match std::str::from_utf8(b) {
+            ColumnValue::Text(b) => match core::str::from_utf8(b) {
                 Ok(s) => Some(s),
                 Err(e) => {
                     self.ctx
@@ -749,8 +749,8 @@ impl<'a> LenientColumnValueDeserializer<'a> {
     /// Parse text into `T`; record an error and return the type's default on failure.
     fn parse_or_default<T>(&self, target: &str) -> T
     where
-        T: std::str::FromStr + Default,
-        T::Err: std::fmt::Display,
+        T: core::str::FromStr + Default,
+        T::Err: core::fmt::Display,
     {
         match self.try_text(target) {
             Some(s) => s.parse::<T>().unwrap_or_else(|e| {
@@ -772,7 +772,7 @@ impl<'de, 'a> de::Deserializer<'de> for LenientColumnValueDeserializer<'a> {
         // Mirror strict deserialize_any; these paths don't error.
         match self.value {
             ColumnValue::Null => visitor.visit_none(),
-            ColumnValue::Text(b) => match std::str::from_utf8(b) {
+            ColumnValue::Text(b) => match core::str::from_utf8(b) {
                 Ok(s) => visitor.visit_str(s),
                 Err(_) => visitor.visit_bytes(b),
             },
@@ -958,7 +958,7 @@ impl<'de, 'a> de::Deserializer<'de> for LenientColumnValueDeserializer<'a> {
     ) -> Result<V::Value, Self::Error> {
         // Enum has no sensible per-field default; propagate strict behavior.
         let s = match self.value {
-            ColumnValue::Text(b) => std::str::from_utf8(b).map_err(|e| {
+            ColumnValue::Text(b) => core::str::from_utf8(b).map_err(|e| {
                 ReplicationError::deserialize(format!("invalid UTF-8 for enum: {e}"))
             })?,
             ColumnValue::Null => {
