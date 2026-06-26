@@ -7,11 +7,11 @@
 
 use crate::buffer::BufferReader;
 use crate::error::{ReplicationError, Result};
+use crate::prelude::*;
 use bytes::{Bytes, BytesMut};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use std::sync::Arc;
 
 /// Encode a byte slice as lowercase hex string.
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
@@ -25,7 +25,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Decode a hex string to bytes. Returns `Err` on invalid hex.
-fn hex_decode(hex: &str) -> std::result::Result<Vec<u8>, &'static str> {
+fn hex_decode(hex: &str) -> core::result::Result<Vec<u8>, &'static str> {
     if !hex.len().is_multiple_of(2) {
         return Err("odd hex length");
     }
@@ -128,7 +128,7 @@ impl ColumnValue {
     #[inline]
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Self::Text(b) => std::str::from_utf8(b).ok(),
+            Self::Text(b) => core::str::from_utf8(b).ok(),
             _ => None,
         }
     }
@@ -189,11 +189,11 @@ impl ColumnValue {
     }
 }
 
-impl std::fmt::Display for ColumnValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ColumnValue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Null => write!(f, "NULL"),
-            Self::Text(b) => match std::str::from_utf8(b) {
+            Self::Text(b) => match core::str::from_utf8(b) {
                 Ok(s) => write!(f, "{s}"),
                 Err(_) => write!(f, "<invalid utf-8: {} bytes>", b.len()),
             },
@@ -242,10 +242,10 @@ impl Serialize for ColumnValue {
     fn serialize<S: serde::Serializer>(
         &self,
         serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
+    ) -> core::result::Result<S::Ok, S::Error> {
         match self {
             Self::Null => serializer.serialize_none(),
-            Self::Text(b) => match std::str::from_utf8(b) {
+            Self::Text(b) => match core::str::from_utf8(b) {
                 Ok(s) => serializer.serialize_str(s),
                 Err(_) => {
                     // Non-UTF-8 text cannot be represented as a JSON string, Emit the tagged binary form so the bytes survive round-trip.
@@ -266,42 +266,42 @@ impl Serialize for ColumnValue {
 impl<'de> Deserialize<'de> for ColumnValue {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
+    ) -> core::result::Result<Self, D::Error> {
         struct Visitor;
 
         impl<'de> serde::de::Visitor<'de> for Visitor {
             type Value = ColumnValue;
 
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
                 f.write_str(r#"a string, null, or {"$binary": "hex..."}"#)
             }
 
-            fn visit_none<E: serde::de::Error>(self) -> std::result::Result<ColumnValue, E> {
+            fn visit_none<E: serde::de::Error>(self) -> core::result::Result<ColumnValue, E> {
                 Ok(ColumnValue::Null)
             }
 
-            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<ColumnValue, E> {
+            fn visit_unit<E: serde::de::Error>(self) -> core::result::Result<ColumnValue, E> {
                 Ok(ColumnValue::Null)
             }
 
             fn visit_some<D: serde::Deserializer<'de>>(
                 self,
                 deserializer: D,
-            ) -> std::result::Result<ColumnValue, D::Error> {
+            ) -> core::result::Result<ColumnValue, D::Error> {
                 deserializer.deserialize_any(self)
             }
 
             fn visit_str<E: serde::de::Error>(
                 self,
                 v: &str,
-            ) -> std::result::Result<ColumnValue, E> {
+            ) -> core::result::Result<ColumnValue, E> {
                 Ok(ColumnValue::Text(Bytes::copy_from_slice(v.as_bytes())))
             }
 
             fn visit_map<M: serde::de::MapAccess<'de>>(
                 self,
                 mut map: M,
-            ) -> std::result::Result<ColumnValue, M::Error> {
+            ) -> core::result::Result<ColumnValue, M::Error> {
                 use serde::de::Error;
                 let key: String = map
                     .next_key()?
@@ -522,7 +522,7 @@ impl RowData {
         for _ in 0..count {
             let name_len = reader.read_u16()? as usize;
             let name_bytes = reader.read_bytes(name_len)?;
-            let name = std::str::from_utf8(&name_bytes)
+            let name = core::str::from_utf8(&name_bytes)
                 .map_err(|e| ReplicationError::protocol(format!("Invalid column name: {e}")))?;
             let name = Arc::from(name);
             let value = ColumnValue::decode(reader)?;
@@ -549,7 +549,7 @@ impl Serialize for RowData {
     fn serialize<S: serde::Serializer>(
         &self,
         serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
+    ) -> core::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let mut map = serializer.serialize_map(Some(self.columns.len()))?;
         for (k, v) in &self.columns {
@@ -562,20 +562,20 @@ impl Serialize for RowData {
 impl<'de> Deserialize<'de> for RowData {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
+    ) -> core::result::Result<Self, D::Error> {
         struct Visitor;
 
         impl<'de> serde::de::Visitor<'de> for Visitor {
             type Value = RowData;
 
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
                 f.write_str("a map of column names to values")
             }
 
             fn visit_map<M: serde::de::MapAccess<'de>>(
                 self,
                 mut map: M,
-            ) -> std::result::Result<RowData, M::Error> {
+            ) -> core::result::Result<RowData, M::Error> {
                 let mut cols = SmallVec::with_capacity(map.size_hint().unwrap_or(0));
                 while let Some((k, v)) = map.next_entry::<String, ColumnValue>()? {
                     cols.push((Arc::from(k), v));
@@ -1031,5 +1031,57 @@ mod tests {
 
         assert_eq!(row, decoded);
         assert_eq!(decoded.len(), 12);
+    }
+
+    #[test]
+    fn serde_json_round_trips_null_text_binary() {
+        for cv in [
+            ColumnValue::Null,
+            ColumnValue::text("hello"),
+            ColumnValue::Binary(Bytes::from_static(&[0u8, 1, 2, 255])),
+        ] {
+            let json = serde_json::to_string(&cv).unwrap();
+            let back: ColumnValue = serde_json::from_str(&json).unwrap();
+            assert_eq!(cv, back, "round trip failed via {json}");
+        }
+    }
+
+    #[test]
+    fn serde_text_invalid_utf8_round_trips_as_binary() {
+        let cv = ColumnValue::Text(Bytes::from_static(&[0xff, 0xfe]));
+        let json = serde_json::to_string(&cv).unwrap();
+        assert!(json.contains("$binary"));
+        let back: ColumnValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ColumnValue::Binary(Bytes::from_static(&[0xff, 0xfe])));
+    }
+
+    #[test]
+    fn serde_column_value_rejects_bad_input() {
+        assert!(serde_json::from_str::<ColumnValue>(r#"{"nope":"x"}"#).is_err());
+        assert!(serde_json::from_str::<ColumnValue>(r#"{"$binary":"zz"}"#).is_err());
+        assert!(serde_json::from_str::<ColumnValue>("42").is_err());
+    }
+
+    #[test]
+    fn serde_visit_unit_is_null() {
+        use serde::de::value::{Error as ValueError, UnitDeserializer};
+        let cv = ColumnValue::deserialize(UnitDeserializer::<ValueError>::new()).unwrap();
+        assert_eq!(cv, ColumnValue::Null);
+    }
+
+    #[test]
+    fn rowdata_serde_json_round_trip() {
+        let row = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("name", ColumnValue::text("alice")),
+            (
+                "blob",
+                ColumnValue::Binary(Bytes::from_static(&[1u8, 2, 3])),
+            ),
+        ]);
+        let json = serde_json::to_string(&row).unwrap();
+        let back: RowData = serde_json::from_str(&json).unwrap();
+        assert_eq!(row, back);
+        assert!(serde_json::from_str::<RowData>("42").is_err());
     }
 }

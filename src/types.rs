@@ -5,11 +5,11 @@
 
 use crate::buffer::BufferReader;
 use crate::error::{ReplicationError, Result};
+use crate::prelude::*;
 use crate::protocol::message_types;
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
+#[cfg(feature = "std")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // PostgreSQL constants
@@ -82,7 +82,7 @@ impl<T> CachePadded<T> {
     }
 }
 
-impl<T> std::ops::Deref for CachePadded<T> {
+impl<T> core::ops::Deref for CachePadded<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -90,12 +90,13 @@ impl<T> std::ops::Deref for CachePadded<T> {
     }
 }
 
-impl<T> std::ops::DerefMut for CachePadded<T> {
+impl<T> core::ops::DerefMut for CachePadded<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.value
     }
 }
 
+#[cfg(feature = "std")]
 /// Convert SystemTime to PostgreSQL timestamp format (microseconds since 2000-01-01)
 ///
 /// PostgreSQL uses a different epoch than Unix (2000-01-01 vs 1970-01-01).
@@ -322,8 +323,8 @@ impl SlotType {
     }
 }
 
-impl std::fmt::Display for SlotType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for SlotType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.as_str())
     }
 }
@@ -437,7 +438,7 @@ impl Lsn {
 }
 
 /// Parse LSN from PostgreSQL string format (e.g., "16/B374D848")
-impl std::str::FromStr for Lsn {
+impl core::str::FromStr for Lsn {
     type Err = ReplicationError;
 
     fn from_str(s: &str) -> Result<Self> {
@@ -445,8 +446,8 @@ impl std::str::FromStr for Lsn {
     }
 }
 
-impl std::fmt::Display for Lsn {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Lsn {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", format_lsn(self.0))
     }
 }
@@ -633,7 +634,7 @@ pub struct ChangeEvent {
     pub lsn: Lsn,
 
     /// Additional user-defined metadata (key-value string pairs).
-    pub metadata: Option<HashMap<String, String>>,
+    pub metadata: Option<BTreeMap<String, String>>,
 }
 
 impl ChangeEvent {
@@ -1097,7 +1098,7 @@ impl ChangeEvent {
     }
 
     /// Set metadata for this event
-    pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
+    pub fn with_metadata(mut self, metadata: BTreeMap<String, String>) -> Self {
         self.metadata = Some(metadata);
         self
     }
@@ -1577,7 +1578,7 @@ impl ChangeEvent {
         let has_meta = reader.read_u8()?;
         let metadata = if has_meta != 0 {
             let count = reader.read_u16()? as usize;
-            let mut m = HashMap::with_capacity(count);
+            let mut m = BTreeMap::new();
             for _ in 0..count {
                 let k = decode_string(&mut reader)?;
                 let v = decode_string(&mut reader)?;
@@ -1902,7 +1903,7 @@ fn encode_arc_str(buf: &mut BytesMut, s: &Arc<str>) {
 fn decode_arc_str(reader: &mut BufferReader) -> Result<Arc<str>> {
     let len = reader.read_u16()? as usize;
     let bytes = reader.read_bytes(len)?;
-    let s = std::str::from_utf8(&bytes)
+    let s = core::str::from_utf8(&bytes)
         .map_err(|e| ReplicationError::protocol(format!("Invalid UTF-8 in wire format: {e}")))?;
     Ok(Arc::from(s))
 }
@@ -2335,7 +2336,7 @@ mod tests {
         let event = ChangeEvent::insert("public", "test", 1, data, Lsn::new(100));
         assert!(event.metadata.is_none());
 
-        let mut metadata = HashMap::new();
+        let mut metadata = BTreeMap::new();
         metadata.insert("source".to_string(), "test".to_string());
         metadata.insert("version".to_string(), "2".to_string());
 
@@ -2513,18 +2514,8 @@ mod tests {
         let decoded = ChangeEvent::decode(&buf).expect("decode failed");
         assert_eq!(decoded.lsn, event.lsn);
         assert_eq!(decoded.event_type, event.event_type);
-        // Compare metadata (HashMap doesn't impl Eq but we can check the content)
-        assert_eq!(
-            decoded.metadata.is_some(),
-            event.metadata.is_some(),
-            "metadata presence mismatch"
-        );
-        if let (Some(a), Some(b)) = (&decoded.metadata, &event.metadata) {
-            assert_eq!(a.len(), b.len());
-            for (k, v) in b {
-                assert_eq!(a.get(k), Some(v));
-            }
-        }
+        // BTreeMap implements Eq, so compare metadata directly.
+        assert_eq!(decoded.metadata, event.metadata);
     }
 
     #[test]
@@ -2541,7 +2532,7 @@ mod tests {
     #[test]
     fn test_encode_decode_insert_with_metadata() {
         let data = RowData::from_pairs(vec![("x", ColumnValue::text("1"))]);
-        let mut meta = HashMap::new();
+        let mut meta = BTreeMap::new();
         meta.insert("source".to_string(), "unit-test".to_string());
         meta.insert("version".to_string(), "3".to_string());
         let event =
@@ -2928,7 +2919,7 @@ mod tests {
     fn test_encode_decode_metadata_empty_hashmap() {
         let data = RowData::from_pairs(vec![("a", ColumnValue::text("b"))]);
         let event =
-            ChangeEvent::insert("s", "t", 1, data, Lsn::new(14000)).with_metadata(HashMap::new());
+            ChangeEvent::insert("s", "t", 1, data, Lsn::new(14000)).with_metadata(BTreeMap::new());
         assert_encode_decode_round_trip(&event);
     }
 
@@ -3844,7 +3835,7 @@ mod tests {
     #[test]
     fn test_encode_decode_begin_prepare_with_metadata() {
         let ts = Utc.with_ymd_and_hms(2024, 7, 1, 12, 0, 0).unwrap();
-        let mut meta = HashMap::new();
+        let mut meta = BTreeMap::new();
         meta.insert("source".to_string(), "test".to_string());
         let event = ChangeEvent::begin_prepare(
             42,
@@ -3862,7 +3853,7 @@ mod tests {
     fn test_encode_decode_rollback_prepared_with_metadata() {
         let ts1 = Utc.with_ymd_and_hms(2024, 7, 1, 12, 0, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2024, 7, 1, 12, 5, 0).unwrap();
-        let mut meta = HashMap::new();
+        let mut meta = BTreeMap::new();
         meta.insert("reason".to_string(), "timeout".to_string());
         let event = ChangeEvent::rollback_prepared(
             0,
@@ -3882,7 +3873,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_origin_with_metadata() {
-        let mut meta = HashMap::new();
+        let mut meta = BTreeMap::new();
         meta.insert("cluster".to_string(), "us-east".to_string());
         let event = ChangeEvent::origin(Lsn::new(500), "us_east_origin", Lsn::new(10200))
             .with_metadata(meta);
@@ -3891,7 +3882,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_type_with_metadata() {
-        let mut meta = HashMap::new();
+        let mut meta = BTreeMap::new();
         meta.insert("schema_version".to_string(), "1".to_string());
         let event = ChangeEvent::type_event(12345, "pg_catalog", "my_enum", Lsn::new(10100))
             .with_metadata(meta);

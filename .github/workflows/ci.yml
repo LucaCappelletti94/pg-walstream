@@ -64,6 +64,29 @@ jobs:
     - name: Run unit tests
       run: cargo test --lib --verbose
 
+  no_std:
+    name: no_std builds (host, wasm, bare-metal)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown, aarch64-unknown-none
+
+    - name: Build no_std (alloc) on the host
+      run: cargo build --no-default-features
+
+    - name: Build no_std (alloc) for wasm32-unknown-unknown
+      run: cargo build --no-default-features --target wasm32-unknown-unknown
+
+    - name: Build no_std (alloc) for aarch64-unknown-none (bare-metal)
+      run: cargo build --no-default-features --lib --target aarch64-unknown-none
+
+    - name: Clippy no_std (alloc)
+      run: cargo clippy --no-default-features --lib -- -D warnings
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest

@@ -121,6 +121,24 @@
 //!     Ok(())
 //! }
 //! ```
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+/// Common `alloc` re-exports so each module can `use crate::prelude::*` and work
+/// in both `std` and `no_std + alloc` builds. Glob-imported, so unused entries
+/// never warn, and under `std` they shadow the identical prelude items harmlessly.
+#[allow(unused_imports)]
+pub(crate) mod prelude {
+    pub(crate) use alloc::borrow::{Cow, ToOwned};
+    pub(crate) use alloc::boxed::Box;
+    pub(crate) use alloc::collections::BTreeMap;
+    pub(crate) use alloc::format;
+    pub(crate) use alloc::string::{String, ToString};
+    pub(crate) use alloc::sync::Arc;
+    pub(crate) use alloc::vec;
+    pub(crate) use alloc::vec::Vec;
+}
 
 // Core modules
 pub mod buffer;
@@ -161,7 +179,6 @@ pub use types::{
     format_lsn,
     parse_lsn,
     postgres_timestamp_to_chrono,
-    system_time_to_postgres_timestamp,
     // High-level CDC types
     BaseBackupOptions,
     ChangeEvent,
@@ -181,6 +198,10 @@ pub use types::{
     INVALID_XLOG_REC_PTR,
     PG_EPOCH_OFFSET_SECS,
 };
+
+// `system_time_to_postgres_timestamp` needs a `SystemTime`, so it is std-only.
+#[cfg(feature = "std")]
+pub use types::system_time_to_postgres_timestamp;
 
 // Re-export protocol types
 pub use protocol::{

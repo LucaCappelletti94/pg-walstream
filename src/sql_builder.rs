@@ -6,6 +6,7 @@
 //! to avoid intermediate allocations.
 
 use crate::error::{ReplicationError, Result};
+use crate::prelude::*;
 use crate::types::{
     format_lsn, BaseBackupOptions, ReplicationSlotOptions, SlotType, XLogRecPtr,
     INVALID_XLOG_REC_PTR,

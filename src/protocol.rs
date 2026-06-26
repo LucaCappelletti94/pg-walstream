@@ -5,58 +5,24 @@
 //! - <https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html>
 //! - <https://www.postgresql.org/docs/current/protocol-logical-replication.html>
 
-use crate::buffer::{BufferReader, BufferWriter};
+use crate::buffer::BufferReader;
+#[cfg(feature = "std")]
+use crate::buffer::BufferWriter;
 use crate::column_value::{ColumnValue, RowData};
 use crate::error::{ReplicationError, Result};
-use crate::types::{
-    format_lsn, system_time_to_postgres_timestamp, Oid, TimestampTz, XLogRecPtr, Xid,
-};
+use crate::prelude::*;
+#[cfg(feature = "std")]
+use crate::types::system_time_to_postgres_timestamp;
+use crate::types::{format_lsn, Oid, TimestampTz, XLogRecPtr, Xid};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::Arc;
+#[cfg(feature = "std")]
 use std::time::SystemTime;
 use tracing::debug;
 
-/// Identity hasher for `u32` OIDs.
-///
-/// PostgreSQL OIDs are already 32 bits of good entropy, so a full hash is
-/// wasted work. This hasher passes the OID through to the lower bits of the
-/// returned `u64`, eliminating SipHash overhead on the per-row hot path.
-#[derive(Default)]
-pub struct OidHasher(u64);
-
-impl Hasher for OidHasher {
-    #[inline(always)]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    #[inline(always)]
-    fn write(&mut self, bytes: &[u8]) {
-        // HashMap::get::<&u32> routes through write_u32, so this should not fire
-        // on the hot path; handle it defensively by hashing tail bytes.
-        for &b in bytes {
-            self.0 = self.0.rotate_left(8) ^ u64::from(b);
-        }
-    }
-
-    #[inline(always)]
-    fn write_u32(&mut self, n: u32) {
-        self.0 = u64::from(n);
-    }
-
-    #[inline(always)]
-    fn write_u64(&mut self, n: u64) {
-        self.0 = n;
-    }
-}
-
-/// `HashMap` keyed by `Oid` using the identity hasher.
-pub type RelationMap = HashMap<Oid, RelationInfo, BuildHasherDefault<OidHasher>>;
+/// Map of relations keyed by `Oid`.
+pub type RelationMap = BTreeMap<Oid, RelationInfo>;
 
 /// Message type constants for logical replication protocol
 pub mod message_types {
@@ -444,7 +410,7 @@ impl ColumnData {
             return None;
         }
 
-        match std::str::from_utf8(&self.data) {
+        match core::str::from_utf8(&self.data) {
             Ok(s) => Some(Cow::Borrowed(s)),
             Err(_) => {
                 // Fallback: Use lossy conversion (rare case)
@@ -598,6 +564,7 @@ pub struct ReplicationState {
     /// Last applied LSN
     pub last_applied_lsn: XLogRecPtr,
     /// Last feedback time
+    #[cfg(feature = "std")]
     pub last_feedback_time: std::time::Instant,
     /// Last LSN values sent in feedback (for throttling)
     last_sent_flush_lsn: XLogRecPtr,
@@ -608,10 +575,11 @@ impl ReplicationState {
     #[inline]
     pub fn new() -> Self {
         Self {
-            relations: RelationMap::with_capacity_and_hasher(64, BuildHasherDefault::default()),
+            relations: RelationMap::new(),
             last_received_lsn: 0,
             last_flushed_lsn: 0,
             last_applied_lsn: 0,
+            #[cfg(feature = "std")]
             last_feedback_time: std::time::Instant::now(),
             last_sent_flush_lsn: 0,
             last_sent_applied_lsn: 0,
@@ -657,6 +625,7 @@ impl ReplicationState {
         }
     }
 
+    #[cfg(feature = "std")]
     /// Check if the configured feedback interval has elapsed since the last feedback was sent.
     #[inline]
     pub fn should_send_feedback(&self, interval: std::time::Duration) -> bool {
@@ -669,13 +638,22 @@ impl ReplicationState {
         flush_lsn != self.last_sent_flush_lsn || applied_lsn != self.last_sent_applied_lsn
     }
 
-    /// Mark feedback as sent and record the LSN values sent
-    pub fn mark_feedback_sent_with_lsn(&mut self, flush_lsn: XLogRecPtr, applied_lsn: XLogRecPtr) {
-        self.last_feedback_time = std::time::Instant::now();
+    /// Record the LSN values reported in the last status update. Available in
+    /// `no_std` so a consumer with its own transport can drive `lsn_has_changed`.
+    #[inline]
+    pub fn record_sent_lsns(&mut self, flush_lsn: XLogRecPtr, applied_lsn: XLogRecPtr) {
         self.last_sent_flush_lsn = flush_lsn;
         self.last_sent_applied_lsn = applied_lsn;
     }
 
+    #[cfg(feature = "std")]
+    /// Mark feedback as sent and record the LSN values sent
+    pub fn mark_feedback_sent_with_lsn(&mut self, flush_lsn: XLogRecPtr, applied_lsn: XLogRecPtr) {
+        self.last_feedback_time = std::time::Instant::now();
+        self.record_sent_lsns(flush_lsn, applied_lsn);
+    }
+
+    #[cfg(feature = "std")]
     /// Mark feedback as sent (backward compatibility)
     pub fn mark_feedback_sent(&mut self) {
         self.last_feedback_time = std::time::Instant::now();
@@ -1410,6 +1388,7 @@ pub struct KeepaliveMessage {
 /// - Int32: xmin epoch
 /// - Int32: catalog_xmin
 /// - Int32: catalog_xmin epoch
+#[cfg(feature = "std")]
 pub fn build_hot_standby_feedback_message(
     xmin: u32,
     xmin_epoch: u32,
@@ -2220,6 +2199,16 @@ mod tests {
         // But different values should
         assert!(state.lsn_has_changed(600, 300));
         assert!(state.lsn_has_changed(500, 400));
+    }
+
+    #[test]
+    fn test_replication_state_record_sent_lsns_dedup() {
+        // The no_std dedup flow: lsn_has_changed plus record_sent_lsns, no clock.
+        let mut state = ReplicationState::new();
+        assert!(state.lsn_has_changed(700, 400));
+        state.record_sent_lsns(700, 400);
+        assert!(!state.lsn_has_changed(700, 400));
+        assert!(state.lsn_has_changed(800, 400));
     }
 
     #[test]
