@@ -865,10 +865,6 @@ impl PgReplicationConnection {
 }
 
 /// Safe wrapper for a PostgreSQL result.
-///
-/// [`get_value`](Self::get_value) decodes a cell as a lossy UTF-8 `String`. For
-/// byte-exact access, or to tell a SQL `NULL` apart from an empty value, use
-/// [`get_bytes`](Self::get_bytes).
 pub struct PgResult {
     result: *mut PGresult,
 }
@@ -915,22 +911,14 @@ impl PgResult {
         }
     }
 
-    /// Get a field value as raw bytes, borrowed from this `PgResult`.
+    /// Get a field value as raw bytes, borrowed until this `PgResult` drops.
     ///
-    /// Returns `None` if the cell is SQL `NULL`, if `row` or `col` is out of
-    /// range, or if either index is negative. Unlike [`Self::get_value`], the
-    /// slice is byte-exact: it preserves embedded NUL bytes and non-UTF8
-    /// sequences, as required for `BYTEA` columns and for any column read in
-    /// binary protocol mode.
-    ///
-    /// The slice borrows from `self` and is valid until this `PgResult` is
-    /// dropped. For an owned copy, see [`Self::get_bytes_owned`].
+    /// `None` for SQL `NULL` or an out-of-range/negative index. Byte-exact,
+    /// unlike the lossy `get_value`. Owned variant: [`Self::get_bytes_owned`].
     pub fn get_bytes(&self, row: i32, col: i32) -> Option<&[u8]> {
         if row < 0 || col < 0 || row >= self.ntuples() || col >= self.nfields() {
             return None;
         }
-        // PQgetisnull returns 1 for SQL NULL, 0 otherwise (including ''::bytea),
-        // which is how a NULL cell is told apart from an empty value.
         if unsafe { PQgetisnull(self.result, row, col) } != 0 {
             return None;
         }
@@ -939,22 +927,13 @@ impl PgResult {
             return None;
         }
         let len = unsafe { PQgetlength(self.result, row, col) };
-        // SAFETY:
-        // - `ptr` is non-null (checked above) and points into the buffer owned
-        //   by `self.result`, which libpq keeps alive until `PQclear`.
-        // - `len` is libpq's reported byte length for a valid, non-NULL cell and
-        //   is `>= 0`, so the cast to `usize` is exact.
-        // - That buffer holds `len` contiguous, initialized bytes.
-        // - The slice lifetime is bounded by `&self`, so it cannot outlive the
-        //   `PQclear` in `Drop`, and no mutable aliasing exists because
-        //   `PgResult` is not `Sync` and this takes `&self`.
+        // SAFETY: non-null `ptr` to `len >= 0` initialized bytes owned by
+        // `self.result` (freed only in `Drop`); the `&self` slice cannot outlive
+        // it and `PgResult` is not `Sync`, so there is no aliasing.
         Some(unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), len as usize) })
     }
 
-    /// Get a field value as owned bytes.
-    ///
-    /// Equivalent to `self.get_bytes(row, col).map(<[u8]>::to_vec)`, for
-    /// consumers that need to drop this `PgResult` before processing the cell.
+    /// [`Self::get_bytes`] copied into a `Vec`, to outlive this `PgResult`.
     pub fn get_bytes_owned(&self, row: i32, col: i32) -> Option<Vec<u8>> {
         self.get_bytes(row, col).map(<[u8]>::to_vec)
     }
@@ -2314,9 +2293,8 @@ mod tests {
 
     // === PgResult::get_bytes / get_bytes_owned ===
 
-    /// Build a single-row `PgResult` with one binary column per `cells` entry,
-    /// using libpq's result-construction API so no server is needed. `None`
-    /// sets a SQL NULL cell, `Some(bytes)` sets a binary value (len may be 0).
+    /// One-row `PgResult` built via libpq's result API (no server). `None` is a
+    /// SQL NULL cell, `Some(bytes)` a binary value (len may be 0).
     fn make_bytea_result(cells: &[Option<&[u8]>]) -> PgResult {
         use libpq_sys::{
             ExecStatusType, PGresAttDesc, PQmakeEmptyPGresult, PQsetResultAttrs, PQsetvalue,

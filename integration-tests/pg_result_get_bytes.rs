@@ -1,13 +1,9 @@
 #![cfg(all(feature = "libpq", not(feature = "rustls-tls")))]
 
-//! Live check for `PgResult::get_bytes` against a real PostgreSQL result.
-//!
-//! `exec` runs a simple (text-format) query, so this covers the two
-//! improvements `get_bytes` offers over `get_value` in that mode: byte-exact
-//! access, and telling a SQL `NULL` apart from an empty value. Recovering raw
-//! binary `BYTEA` additionally needs a binary-format query, which `exec`
-//! (simple query) does not perform. The unit tests in `src/connection/libpq.rs`
-//! cover the raw-bytes path (embedded NUL, non-UTF8) on binary-format cells.
+//! Live check for `PgResult::get_bytes`. `exec` is a text-format query, so this
+//! covers the two text-mode wins over `get_value`: byte-exact access and
+//! telling SQL `NULL` from empty. Raw binary recovery needs a binary-format
+//! query; the unit tests cover that path on binary cells.
 
 use pg_walstream::PgReplicationConnection;
 
