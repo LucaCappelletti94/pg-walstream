@@ -52,12 +52,9 @@ pub enum ReplicationError {
     /// Deserialization errors (when converting RowData to user types)
     Deserialize(String),
 
-    /// Native backend worker thread failures.
-    ///
-    /// Produced only by the rustls-tls backend when its dedicated worker
-    /// thread cannot be reached: the thread failed to spawn, exited before
-    /// completing the operation, or dropped the reply channel. Treated as
-    /// transient so the stream retry logic can reconnect.
+    /// Native (rustls-tls) backend worker thread failure: the thread could not
+    /// be spawned, exited early, or dropped a reply. Transient so the stream
+    /// retry logic can reconnect.
     Backend(String),
 }
 
