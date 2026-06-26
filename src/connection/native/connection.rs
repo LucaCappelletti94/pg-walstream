@@ -33,17 +33,11 @@ use crate::types::{
 #[allow(dead_code)]
 const READ_BUF_INITIAL_CAPACITY: usize = 256 * 1024;
 
-// ── Worker bridge ────────────────────────────────────────────────────────
-//
-// A `NativeConnection` owns no socket. A dedicated worker thread owns the
-// transport plus a current-thread tokio runtime, and all socket I/O runs on
-// that runtime's reactor. The handle forwards work to the worker over a
-// command channel: sync methods block on a `std::sync::mpsc` reply, async
-// methods await a `tokio::sync::oneshot`. Because the socket is created on the
-// worker's reactor and never leaves it, every operation touches one consistent
-// reactor, so the connection works under a current-thread runtime, a
-// multi-thread runtime, or no runtime at all. The old design drove futures
-// with `tokio::task::block_in_place`, which panics on a current-thread runtime.
+// A `NativeConnection` is a handle. A dedicated worker thread owns the socket on
+// its own current-thread runtime, so all I/O stays on one reactor and the
+// connection works under any runtime flavor (or none), unlike the old
+// `block_in_place` bridge that panicked on a current-thread runtime. Sync
+// methods block on a `std::sync::mpsc` reply, async methods await a oneshot.
 
 /// Commands sent from the `NativeConnection` handle to its worker thread.
 ///
@@ -88,13 +82,10 @@ impl Worker {
         query::simple_query(&mut self.transport, &mut self.read_buf, sql).await
     }
 
-    /// Read at least one CopyData payload, returning every message currently
-    /// drained from the buffer as one batch. The handle serves these to the
-    /// caller one at a time, so the cross-thread round trip is amortized across
-    /// the whole batch rather than paid per message.
+    /// Read at least one CopyData payload, returning all messages drained in one
+    /// batch. The handle serves them one at a time to amortize the round trip.
     async fn get_copy_batch(&mut self, token: &CancellationToken) -> Result<VecDeque<Bytes>> {
-        // Return a batch stashed from a previously cancelled request first, so
-        // its already-consumed WAL messages are not skipped.
+        // Return a stash left by a cancelled request before reading more.
         if !self.pending.is_empty() {
             return Ok(std::mem::take(&mut self.pending));
         }
@@ -111,16 +102,13 @@ impl Worker {
                     return Err(err);
                 }
             };
-        // `get_copy_data` pops and returns the first message, leaving the rest
-        // of this read's drained messages in `batch`; restore their order.
+        // `get_copy_data` returned the first message; the rest stayed in `batch`.
         batch.push_front(first);
         Ok(batch)
     }
 
-    /// Run a `GetCopyBatch` command, preserving the batch if the caller went
-    /// away. If the oneshot receiver was dropped (the caller cancelled by
-    /// dropping the future), the already-consumed WAL messages are stashed in
-    /// `pending` and returned on the next request instead of being lost.
+    /// If the caller dropped the reply (cancelled), stash the batch so its
+    /// already-consumed WAL is returned next time instead of being lost.
     async fn handle_get_copy_batch(
         &mut self,
         token: &CancellationToken,
@@ -439,16 +427,11 @@ impl NativeConnection {
         Ok(())
     }
 
-    /// Get copy data from replication stream (truly async, non-blocking).
+    /// Get copy data from the replication stream (truly async, non-blocking).
     ///
-    /// Serves from the local batch buffer first (no channel traffic), and only
-    /// on empty requests a fresh batch from the worker over a oneshot.
-    ///
-    /// Cancel by signalling `cancellation_token`, not by dropping this future.
-    /// If the future is dropped while the worker is delivering a batch, the
-    /// worker stashes that batch and returns it on the next call so no WAL is
-    /// lost. The token is the intended cancellation path and is what the
-    /// streaming loop uses.
+    /// Serves from the local batch buffer first, requesting a fresh batch from
+    /// the worker only when empty. Cancel via `cancellation_token` rather than
+    /// by dropping this future.
     pub async fn get_copy_data_async(
         &mut self,
         cancellation_token: &CancellationToken,
@@ -721,10 +704,8 @@ impl NativeConnection {
 
     /// Gracefully close the replication connection.
     ///
-    /// Sends a `Close` command so the worker performs a best-effort shutdown
-    /// (CopyDone if streaming, then Terminate), waits for it to finish, then
-    /// joins the worker thread. Best-effort I/O errors inside the worker are
-    /// ignored. No panic can occur: there is no `block_in_place` bridge.
+    /// Sends a `Close` command so the worker does a best-effort shutdown
+    /// (CopyDone if streaming, then Terminate), then joins the worker thread.
     fn close_connection(&mut self) {
         if let Some(worker) = self.worker.take() {
             let (reply_tx, reply_rx) = std_mpsc::channel();
@@ -1325,18 +1306,13 @@ mod tests {
         drop(conn); // should not panic
     }
 
-    // === Runtime-flavor coverage for the worker-thread bridge ===
-    //
-    // The sync methods (connect, exec, start_replication, ...) used to drive
-    // their futures with tokio::task::block_in_place, which panics on a
-    // current-thread runtime. These tests pin that behavior across all three
-    // runtime contexts plus the Drop path. Test A is the regression anchor: it
-    // panics on the pre-fix code and passes once the worker bridge lands.
+    // Runtime-flavor coverage for the worker bridge: the sync methods used to
+    // panic in block_in_place on a current-thread runtime. These pin that they
+    // no longer do, across current-thread, multi-thread, no-runtime, and Drop.
 
     #[tokio::test]
     async fn test_sync_method_does_not_panic_on_current_thread_runtime() {
-        // Default #[tokio::test] is a current-thread runtime. A sync call here
-        // must return an error from the dead null socket, never panic.
+        // Default #[tokio::test] is current-thread; a sync call must error, not panic.
         let mut conn = NativeConnection::null_for_testing();
         let result = conn.exec("IDENTIFY_SYSTEM");
         assert!(
