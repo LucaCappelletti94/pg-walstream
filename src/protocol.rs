@@ -567,7 +567,9 @@ pub struct ReplicationState {
     #[cfg(feature = "std")]
     pub last_feedback_time: std::time::Instant,
     /// Last LSN values sent in feedback (for throttling)
+    #[cfg(feature = "std")]
     last_sent_flush_lsn: XLogRecPtr,
+    #[cfg(feature = "std")]
     last_sent_applied_lsn: XLogRecPtr,
 }
 
@@ -581,7 +583,9 @@ impl ReplicationState {
             last_applied_lsn: 0,
             #[cfg(feature = "std")]
             last_feedback_time: std::time::Instant::now(),
+            #[cfg(feature = "std")]
             last_sent_flush_lsn: 0,
+            #[cfg(feature = "std")]
             last_sent_applied_lsn: 0,
         }
     }
@@ -632,6 +636,7 @@ impl ReplicationState {
         self.last_feedback_time.elapsed() >= interval
     }
 
+    #[cfg(feature = "std")]
     /// Check if LSN values have changed since last feedback, this helps avoid sending redundant status updates
     #[inline]
     pub fn lsn_has_changed(&self, flush_lsn: XLogRecPtr, applied_lsn: XLogRecPtr) -> bool {

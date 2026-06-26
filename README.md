@@ -54,14 +54,15 @@ pg_walstream = { version = "0.6.3", default-features = false, features = ["rustl
 
 ## Feature Flags
 
-pg-walstream provides two connection backends, selected at compile time. When both are enabled, `rustls-tls` takes priority:
+pg-walstream provides two connection backends plus a `std` toggle, all selected at compile time. When both backends are enabled, `rustls-tls` takes priority:
 
 | Feature | Default | C Dependencies | Description |
 |---------|---------|----------------|-------------|
-| `libpq` | Yes | `libpq-dev`, `libclang-dev` | Uses PostgreSQL's C client library via FFI. Battle-tested, supports all auth methods natively. |
-| `rustls-tls` | No | `cmake`, `gcc` (build-time only) | Pure-Rust implementation using `rustls` with `aws-lc-rs` crypto backend for hardware-accelerated TLS. No runtime C dependencies. Takes priority when both features are enabled. |
+| `std` | Yes | None | Standard library support. Disable with `default-features = false` for a `no_std` plus `alloc` parser-only build (no connection layer) that compiles for `wasm32-unknown-unknown` and embedded targets. |
+| `libpq` | Yes | `libpq-dev`, `libclang-dev` | Uses PostgreSQL's C client library via FFI. Battle-tested, supports all auth methods natively. Implies `std`. |
+| `rustls-tls` | No | `cmake`, `gcc` (build-time only) | Pure-Rust implementation using `rustls` with `aws-lc-rs` crypto backend for hardware-accelerated TLS. No runtime C dependencies. Takes priority when both backends are enabled. Implies `std`. |
 
-> **Note:** At least one feature must be enabled. Building with no backend features will produce a compile error.
+> **Note:** The protocol parser, encoder, and types need no backend. Building with `default-features = false` gives a `no_std` plus `alloc` build of just those, suitable for wasm and embedded. A connection backend (`libpq` or `rustls-tls`) is required only for the live streaming and connection APIs, and pulls in `std`.
 
 ## System Dependencies
 
