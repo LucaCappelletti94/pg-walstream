@@ -76,11 +76,12 @@ impl core::fmt::Display for ReplicationError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for ReplicationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for ReplicationError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
+            #[cfg(feature = "std")]
             Self::Io(err) => Some(err),
+            #[cfg(feature = "std")]
             Self::StringConversion(err) => Some(err),
             _ => None,
         }
