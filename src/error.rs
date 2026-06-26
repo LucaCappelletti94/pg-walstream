@@ -3,6 +3,8 @@
 //! This module provides error types specifically for replication protocol
 //! operations, connection handling, and message parsing.
 
+use crate::prelude::*;
+
 /// Comprehensive error types for replication operations
 #[derive(Debug)]
 pub enum ReplicationError {
@@ -36,9 +38,11 @@ pub enum ReplicationError {
     /// Configuration errors
     Config(String),
 
+    #[cfg(feature = "std")]
     /// IO errors
     Io(std::io::Error),
 
+    #[cfg(feature = "std")]
     /// String conversion errors (from CString operations)
     StringConversion(std::ffi::NulError),
 
@@ -49,8 +53,8 @@ pub enum ReplicationError {
     Deserialize(String),
 }
 
-impl std::fmt::Display for ReplicationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ReplicationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Protocol(msg) => write!(f, "Protocol parsing error: {msg}"),
             Self::Buffer(msg) => write!(f, "Buffer error: {msg}"),
@@ -62,7 +66,9 @@ impl std::fmt::Display for ReplicationError {
             Self::Timeout(msg) => write!(f, "Operation timed out: {msg}"),
             Self::Cancelled(msg) => write!(f, "Operation was cancelled: {msg}"),
             Self::Config(msg) => write!(f, "Configuration error: {msg}"),
+            #[cfg(feature = "std")]
             Self::Io(err) => write!(f, "IO error: {err}"),
+            #[cfg(feature = "std")]
             Self::StringConversion(err) => write!(f, "String conversion error: {err}"),
             Self::Generic(msg) => write!(f, "Replication error: {msg}"),
             Self::Deserialize(msg) => write!(f, "Deserialization error: {msg}"),
@@ -70,22 +76,26 @@ impl std::fmt::Display for ReplicationError {
     }
 }
 
-impl std::error::Error for ReplicationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for ReplicationError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
+            #[cfg(feature = "std")]
             Self::Io(err) => Some(err),
+            #[cfg(feature = "std")]
             Self::StringConversion(err) => Some(err),
             _ => None,
         }
     }
 }
 
+#[cfg(feature = "std")]
 impl From<std::io::Error> for ReplicationError {
     fn from(err: std::io::Error) -> Self {
         Self::Io(err)
     }
 }
 
+#[cfg(feature = "std")]
 impl From<std::ffi::NulError> for ReplicationError {
     fn from(err: std::ffi::NulError) -> Self {
         Self::StringConversion(err)
@@ -93,7 +103,7 @@ impl From<std::ffi::NulError> for ReplicationError {
 }
 
 impl serde::de::Error for ReplicationError {
-    fn custom<T: std::fmt::Display>(msg: T) -> Self {
+    fn custom<T: core::fmt::Display>(msg: T) -> Self {
         ReplicationError::Deserialize(msg.to_string())
     }
 }
@@ -166,11 +176,14 @@ impl ReplicationError {
 
     /// Check if the error is transient (can be retried)
     pub fn is_transient(&self) -> bool {
+        #[cfg(feature = "std")]
+        if matches!(self, ReplicationError::Io(_)) {
+            return true;
+        }
         matches!(
             self,
             ReplicationError::TransientConnection(_)
                 | ReplicationError::Timeout(_)
-                | ReplicationError::Io(_)
                 | ReplicationError::ReplicationConnection(_)
         )
     }
@@ -192,7 +205,7 @@ impl ReplicationError {
 }
 
 /// Result type for replication operations
-pub type Result<T> = std::result::Result<T, ReplicationError>;
+pub type Result<T> = core::result::Result<T, ReplicationError>;
 
 #[cfg(test)]
 mod tests {
@@ -223,6 +236,29 @@ mod tests {
         assert!(err.is_transient());
         assert!(!err.is_permanent());
         assert!(!err.is_cancelled());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_io_error_is_transient() {
+        let err = ReplicationError::Io(std::io::Error::other("disk hiccup"));
+        assert!(err.is_transient());
+        assert!(!err.is_permanent());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_io_error_display() {
+        let err = ReplicationError::Io(std::io::Error::other("boom"));
+        assert_eq!(err.to_string(), "IO error: boom");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_string_conversion_error_display() {
+        let nul = std::ffi::CString::new("a\0b").unwrap_err();
+        let err = ReplicationError::StringConversion(nul);
+        assert!(err.to_string().starts_with("String conversion error:"));
     }
 
     #[test]
