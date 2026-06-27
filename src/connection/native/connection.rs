@@ -19,6 +19,7 @@ use super::{copy, query, wire};
 use super::{NativePgResult, NativeResultStatus};
 
 use crate::buffer::BufferWriter;
+use crate::connection::params::ToSql;
 use crate::error::{ReplicationError, Result};
 use crate::protocol::build_hot_standby_feedback_message;
 use crate::types::{
@@ -47,6 +48,13 @@ enum Command {
     /// status and `is_ok`, so this stays a thin I/O primitive.
     Query {
         sql: String,
+        reply: std_mpsc::Sender<Result<NativePgResult>>,
+    },
+    /// Run a parameterized query. The handle text-encodes the parameters, the
+    /// worker runs the extended-query exchange and replies with the result.
+    ExecParams {
+        sql: String,
+        params: Vec<Option<String>>,
         reply: std_mpsc::Sender<Result<NativePgResult>>,
     },
     /// Read the next batch of CopyData payloads from the replication stream.
@@ -80,6 +88,14 @@ struct Worker {
 impl Worker {
     async fn query(&mut self, sql: &str) -> Result<NativePgResult> {
         query::simple_query(&mut self.transport, &mut self.read_buf, sql).await
+    }
+
+    async fn exec_params(
+        &mut self,
+        sql: &str,
+        params: Vec<Option<String>>,
+    ) -> Result<NativePgResult> {
+        query::extended_query(&mut self.transport, &mut self.read_buf, sql, params).await
     }
 
     /// Read at least one CopyData payload, returning all messages drained in one
@@ -235,6 +251,9 @@ fn run_worker(
                 Command::Query { sql, reply } => {
                     let _ = reply.send(worker.query(&sql).await);
                 }
+                Command::ExecParams { sql, params, reply } => {
+                    let _ = reply.send(worker.exec_params(&sql, params).await);
+                }
                 Command::GetCopyBatch { token, reply } => {
                     worker.handle_get_copy_batch(&token, reply).await;
                 }
@@ -376,6 +395,34 @@ impl NativeConnection {
             )));
         }
 
+        Ok(result)
+    }
+
+    /// Execute `sql` with bound parameters via the extended protocol.
+    ///
+    /// Parameters are text-encoded with no declared type, so the server infers
+    /// each type from the query. `Option::<T>::None` binds SQL `NULL`. Rows come
+    /// back text-format, like `exec`.
+    pub fn exec_with_params(&mut self, sql: &str, params: &[&dyn ToSql]) -> Result<NativePgResult> {
+        let encoded: Vec<Option<String>> = params.iter().map(|p| p.to_sql_text()).collect();
+        let (reply_tx, reply_rx) = std_mpsc::channel();
+        self.cmd_tx
+            .send(Command::ExecParams {
+                sql: sql.to_string(),
+                params: encoded,
+                reply: reply_tx,
+            })
+            .map_err(|_| Self::worker_gone())?;
+        let result = reply_rx.recv().map_err(|_| Self::worker_gone())??;
+
+        if !result.is_ok() {
+            let error_msg = result
+                .error_message()
+                .unwrap_or_else(|| "Unknown error".to_string());
+            return Err(ReplicationError::protocol(format!(
+                "Query execution failed: {error_msg}"
+            )));
+        }
         Ok(result)
     }
 

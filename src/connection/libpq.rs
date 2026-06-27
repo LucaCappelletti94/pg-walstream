@@ -29,6 +29,7 @@
 //!
 //! This ensures that no thread is blocked waiting for network I/O, maximizing
 //! throughput and enabling efficient concurrent processing of multiple replication streams.
+use super::params::ToSql;
 use crate::buffer::BufferWriter;
 use crate::error::{ReplicationError, Result};
 use crate::protocol::build_hot_standby_feedback_message;
@@ -40,7 +41,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use libpq_sys::*;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
-use std::os::raw::c_void;
+use std::os::raw::{c_char, c_int, c_void};
 use std::os::unix::io::RawFd;
 use std::time::SystemTime;
 use std::{ptr, slice};
@@ -241,23 +242,21 @@ impl PgReplicationConnection {
     pub fn exec(&mut self, query: &str) -> Result<PgResult> {
         let c_query = CString::new(query)
             .map_err(|e| ReplicationError::protocol(format!("Invalid query string: {e}")))?;
-
         let result = unsafe { PQexec(self.conn, c_query.as_ptr()) };
+        self.check_pg_result(query, result)
+    }
 
+    /// Wrap a raw libpq result, log its status, and map a non-OK status to an
+    /// error. Shared by `exec` and `exec_with_params`.
+    fn check_pg_result(&self, query: &str, result: *mut PGresult) -> Result<PgResult> {
         if result.is_null() {
             return Err(ReplicationError::protocol(
                 "Query execution failed - null result".to_string(),
             ));
         }
-
         let pg_result = PgResult::new(result);
-        // Check for errors
         let status = pg_result.status();
-        info!(
-            "query : {} pg_result.status() : {:?}",
-            query,
-            pg_result.status()
-        );
+        info!("query : {} pg_result.status() : {:?}", query, status);
         if !matches!(
             status,
             ExecStatusType::PGRES_TUPLES_OK
@@ -272,8 +271,55 @@ impl PgReplicationConnection {
                 "Query execution failed: {error_msg}"
             )));
         }
-
         Ok(pg_result)
+    }
+
+    /// Execute `sql` with bound parameters via libpq's `PQexecParams`.
+    ///
+    /// Parameters are sent text-format with no declared type, so the server
+    /// infers each type from the query. Cast placeholders (`$1::int4`) when the
+    /// context is ambiguous. `Option::<T>::None` binds SQL `NULL`. Rows come back
+    /// text-format, like `exec`.
+    pub fn exec_with_params(&mut self, sql: &str, params: &[&dyn ToSql]) -> Result<PgResult> {
+        let c_sql = CString::new(sql)
+            .map_err(|e| ReplicationError::protocol(format!("Invalid query string: {e}")))?;
+
+        // Encode each parameter as a text C string. `None` is SQL NULL.
+        let encoded: Vec<Option<CString>> = params
+            .iter()
+            .enumerate()
+            .map(|(i, param)| match param.to_sql_text() {
+                Some(text) => CString::new(text).map(Some).map_err(|e| {
+                    ReplicationError::protocol(format!(
+                        "parameter {i} contains an interior NUL byte: {e}"
+                    ))
+                }),
+                None => Ok(None),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // `values` borrows from `encoded`, which must outlive the call.
+        let values: Vec<*const c_char> = encoded
+            .iter()
+            .map(|cell| match cell {
+                Some(c) => c.as_ptr(),
+                None => ptr::null(),
+            })
+            .collect();
+
+        let result = unsafe {
+            PQexecParams(
+                self.conn,
+                c_sql.as_ptr(),
+                params.len() as c_int,
+                ptr::null(), // paramTypes: let the server infer
+                values.as_ptr(),
+                ptr::null(), // paramLengths: ignored for text params
+                ptr::null(), // paramFormats: all text
+                0,           // resultFormat: text
+            )
+        };
+        self.check_pg_result(sql, result)
     }
 
     /// Send IDENTIFY_SYSTEM command
@@ -2389,6 +2435,20 @@ mod tests {
 
         let res_null = make_bytea_result(&[None]);
         assert_eq!(res_null.get_bytes_owned(0, 0), None);
+    }
+
+    #[test]
+    fn exec_with_params_rejects_interior_nul_param() {
+        // The interior NUL is caught while encoding, before the connection is
+        // touched, so a null test connection is enough.
+        let mut conn = PgReplicationConnection::null_for_testing();
+        let Err(err) = conn.exec_with_params("SELECT $1::text", &[&"a\0b"]) else {
+            panic!("expected an interior NUL error");
+        };
+        assert!(
+            err.to_string().contains("interior NUL"),
+            "expected interior NUL error, got: {err}"
+        );
     }
 
     #[test]

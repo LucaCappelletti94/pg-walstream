@@ -10,6 +10,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use super::result::{NativePgResult, NativeResultStatus};
 use super::wire;
 use crate::error::ReplicationError;
+use bytes::BufMut;
+use postgres_protocol::message::frontend;
+use postgres_protocol::IsNull as PgIsNull;
 
 /// Execute a simple query and return the result.
 ///
@@ -84,6 +87,81 @@ pub async fn simple_query<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
 
+    Ok(result)
+}
+
+/// Execute `sql` with text-format bound parameters via the extended protocol.
+///
+/// Parameters carry no declared type, so the server infers each. A portal
+/// Describe recovers the result-column metadata. `None` elements bind SQL `NULL`.
+pub async fn extended_query<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    buf: &mut BytesMut,
+    sql: &str,
+    params: Vec<Option<String>>,
+) -> Result<NativePgResult, ReplicationError> {
+    let mut out = BytesMut::new();
+    frontend::parse("", sql, std::iter::empty::<u32>(), &mut out)
+        .map_err(|e| ReplicationError::protocol(format!("Parse message build failed: {e}")))?;
+    frontend::bind(
+        "",
+        "",
+        std::iter::empty::<i16>(), // all parameters in text format
+        params.iter(),
+        |param: &Option<String>, b: &mut BytesMut| match param {
+            Some(text) => {
+                b.put_slice(text.as_bytes());
+                Ok(PgIsNull::No)
+            }
+            None => Ok(PgIsNull::Yes),
+        },
+        std::iter::empty::<i16>(), // all result columns in text format
+        &mut out,
+    )
+    .map_err(|e| {
+        let detail = match e {
+            frontend::BindError::Conversion(err) => err.to_string(),
+            frontend::BindError::Serialization(err) => err.to_string(),
+        };
+        ReplicationError::protocol(format!("Bind message build failed: {detail}"))
+    })?;
+    frontend::describe(b'P', "", &mut out)
+        .map_err(|e| ReplicationError::protocol(format!("Describe message build failed: {e}")))?;
+    frontend::execute("", 0, &mut out)
+        .map_err(|e| ReplicationError::protocol(format!("Execute message build failed: {e}")))?;
+    frontend::sync(&mut out);
+    wire::write_all(stream, &out).await?;
+    wire::flush(stream).await?;
+
+    let mut result = NativePgResult::new();
+    loop {
+        let msg = wire::read_message(stream, buf).await?;
+        if msg.is_empty() {
+            continue;
+        }
+        match msg[0] {
+            b'1' | b'2' | b'n' => {} // ParseComplete, BindComplete, NoData
+            b'T' => result.parse_row_description(&msg[5..]),
+            b'D' => result.parse_data_row(&msg[5..]),
+            b'C' => {
+                if result.status == NativeResultStatus::Empty {
+                    result.status = NativeResultStatus::CommandOk;
+                }
+            }
+            b'Z' => break, // ReadyForQuery
+            b'E' => {
+                let fields = super::error::parse_error_fields(&msg[5..]);
+                result.status = NativeResultStatus::FatalError;
+                result.error_msg = Some(format!("{fields}"));
+                // ReadyForQuery follows because we sent Sync.
+            }
+            b'N' => {
+                let fields = super::error::parse_error_fields(&msg[5..]);
+                tracing::info!("Server notice: {}", fields);
+            }
+            _ => {}
+        }
+    }
     Ok(result)
 }
 
