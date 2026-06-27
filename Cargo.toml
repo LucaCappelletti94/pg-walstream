@@ -114,6 +114,10 @@ path = "integration-tests/pg_result_get_bytes.rs"
 name = "binary_columns"
 path = "integration-tests/binary_columns.rs"
 
+[[test]]
+name = "exec_with_params"
+path = "integration-tests/exec_with_params.rs"
+
 [[bench]]
 name = "wal_pipeline"
 harness = false
