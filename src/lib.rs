@@ -231,6 +231,10 @@ pub use tokio_util::sync::CancellationToken;
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub use connection::{PgReplicationConnection, PgResult};
 
+// Crate-local `ToSql` for `exec_with_params` (no `postgres-types` dependency).
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+pub use connection::params::ToSql;
+
 // Re-export retry types
 #[cfg(any(feature = "libpq", feature = "rustls-tls"))]
 pub use retry::{ExponentialBackoff, ReplicationConnectionRetry, RetryConfig};

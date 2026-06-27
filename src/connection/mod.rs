@@ -16,6 +16,10 @@
 //! Both backends expose the same public types: `PgReplicationConnection` and
 //! `PgResult`.
 
+// Crate-local `ToSql` for parameterized queries, shared by both backends.
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+pub mod params;
+
 // ── libpq backend (default) ──────────────────────────────────────────────────
 
 #[cfg(all(feature = "libpq", not(feature = "rustls-tls")))]
