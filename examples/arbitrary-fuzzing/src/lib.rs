@@ -52,9 +52,7 @@ pub mod generators {
     }
 
     /// Generate an arbitrary `ReplicaIdentity`.
-    pub fn arbitrary_replica_identity(
-        u: &mut Unstructured,
-    ) -> arbitrary::Result<ReplicaIdentity> {
+    pub fn arbitrary_replica_identity(u: &mut Unstructured) -> arbitrary::Result<ReplicaIdentity> {
         const VARIANTS: &[ReplicaIdentity] = &[
             ReplicaIdentity::Default,
             ReplicaIdentity::Nothing,
@@ -174,11 +172,7 @@ pub mod generators {
                         None
                     },
                     new_tuple: arbitrary_tuple_data(u)?,
-                    key_type: if has_old {
-                        Some(u.arbitrary()?)
-                    } else {
-                        None
-                    },
+                    key_type: if has_old { Some(u.arbitrary()?) } else { None },
                 }
             }
             5 => LogicalReplicationMessage::Delete {
@@ -232,16 +226,8 @@ pub mod generators {
                 LogicalReplicationMessage::StreamAbort {
                     xid: u.arbitrary()?,
                     subtransaction_xid: u.arbitrary()?,
-                    abort_lsn: if has_v4 {
-                        Some(u.arbitrary()?)
-                    } else {
-                        None
-                    },
-                    abort_timestamp: if has_v4 {
-                        Some(u.arbitrary()?)
-                    } else {
-                        None
-                    },
+                    abort_lsn: if has_v4 { Some(u.arbitrary()?) } else { None },
+                    abort_timestamp: if has_v4 { Some(u.arbitrary()?) } else { None },
                 }
             }
             14 => LogicalReplicationMessage::BeginPrepare {
