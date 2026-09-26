@@ -94,9 +94,7 @@ fn main() {
             }
         }
     }
-    println!(
-        "  null={saw_null}  text={saw_text}  binary={saw_binary}  unchanged={saw_unchanged}"
-    );
+    println!("  null={saw_null}  text={saw_text}  binary={saw_binary}  unchanged={saw_unchanged}");
     assert!(
         saw_null || saw_text || saw_binary || saw_unchanged,
         "Should produce at least one ColumnData variant"
