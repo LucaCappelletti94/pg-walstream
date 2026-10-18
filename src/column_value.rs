@@ -344,11 +344,18 @@ impl<'de> Deserialize<'de> for ColumnValue {
 /// assert_eq!(row.get("id").and_then(|v| v.as_str()), Some("1"));
 /// ```
 ///
-/// Absent columns were not carried by the source, including unchanged TOAST (`'u'`) cells and non-key cells of key-only (`'K'`) old tuples.
-/// SQL `NULL` cells carried by the source are materialised as [`ColumnValue::Null`].
+/// pgoutput encodes an out-of-line (TOASTed) column that an UPDATE did not
+/// touch as `'u'`, which this crate drops from the row entirely. Every other
+/// cell is kept, and both SQL NULLs and the NULL padding of a key-only old
+/// image are [`ColumnValue::Null`], so "absent from the row" is an unambiguous
+/// encoding of "unchanged, reuse the value already in the target".
 ///
-/// A sink must build partial `UPDATE` statements from the columns present in the row and retain stored values for unchanged TOAST cells.
-/// Missing old cells cannot establish the previous value.
+/// A sink must therefore build partial `UPDATE` statements from what the row
+/// actually contains (iterate, or check [`get`](Self::get) for `None`).
+/// Substituting NULL for a missing column overwrites good data with nulls.
+/// Setting the table's `REPLICA IDENTITY FULL` does not change this; only
+/// `ALTER TABLE ... SET (toast_tuple_target = ...)` or keeping the column
+/// inline avoids it.
 #[derive(Debug, Clone, Eq)]
 pub struct RowData {
     columns: SmallVec<[(Arc<str>, ColumnValue); 8]>,
