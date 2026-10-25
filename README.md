@@ -297,17 +297,17 @@ A complete, runnable version of the above — including a row inserted *during* 
 
 ### Tables added while the stream runs
 
-`capture_aligned` copies extra tables through a temporary side slot's exported snapshot, exact at its consistent point `C`. Apply the running stream's transactions committed below `C` first, then the copy, then everything from the first `Begin` whose `final_lsn` is at or past `C`:
+`capture_aligned` copies extra tables through a temporary side slot's exported snapshot, exact at its consistent point `C`. Apply the running stream's transactions whose `EventType::commit_lsn()` is below `C` first, then the copy, then every transaction from the first one committed at or past `C`:
 
 ```rust
 let mut copy = stream.capture_aligned(&[("public", "orders")]).await?;
 let c = copy.consistent_point();
-// ...keep applying stream transactions whose Begin.final_lsn < c...
+// ...keep applying stream transactions whose commit_lsn() < c...
 while let Some(row) = copy.next_row().await? {
     sink.load(row).await?;
 }
 copy.finish()?;
-// ...then every transaction from the first Begin.final_lsn >= c on.
+// ...then every transaction from the first commit_lsn() >= c on.
 ```
 
 The capture briefly holds a second replication connection and a temporary slot, waits for transactions open at that moment to end, and pins `xmin` until `finish()`.
