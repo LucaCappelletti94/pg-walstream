@@ -297,18 +297,22 @@ A complete, runnable version of the above — including a row inserted *during* 
 
 ### Tables added while the stream runs
 
-`capture_aligned` copies extra tables through a temporary side slot's exported snapshot, exact at its consistent point `C`. Apply the running stream's transactions whose `EventType::commit_lsn()` is below `C` first, then the copy, then every transaction from the first one committed at or past `C`:
+`capture_aligned` copies extra tables through a temporary side slot's exported snapshot, exact at its consistent point `C`. `next_event_before(C)` delivers the running stream's transactions committed below `C` and returns `None` where the copy applies, and the next read continues from the first transaction committed at or past `C`:
 
 ```rust
 let mut copy = stream.capture_aligned(&[("public", "orders")]).await?;
 let c = copy.consistent_point();
-// ...keep applying stream transactions whose commit_lsn() < c...
+while let Some(event) = stream.next_event_before(c, &cancel).await? {
+    sink.apply(event).await?;
+}
 while let Some(row) = copy.next_row().await? {
     sink.load(row).await?;
 }
 copy.finish()?;
-// ...then every transaction from the first commit_lsn() >= c on.
+// stream.next_event(&cancel) continues at the first transaction committed at or past c.
 ```
+
+`EventStream::next_event_before` and `WalRouter::run_before` / `run_aligned` do the same with retries and typed handlers. Raw-protocol loops split on `EventType::commit_lsn()` against `C`, or stop once a keepalive reports `wal_end >= C`.
 
 The capture briefly holds a second replication connection and a temporary slot, waits for transactions open at that moment to end, and pins `xmin` until `finish()`.
 

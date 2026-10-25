@@ -127,6 +127,15 @@ impl AlignedSnapshot {
         self.copy.next_row().await
     }
 
+    /// The next row as a synthetic `Insert` event, so one set of handlers serves the copy and the stream.
+    pub async fn next_event(&mut self) -> Result<Option<crate::types::ChangeEvent>> {
+        Ok(self
+            .copy
+            .next_row()
+            .await?
+            .map(super::events::row_to_insert))
+    }
+
     /// Close the snapshot transaction after a fully consumed copy.
     ///
     /// Errors when the copy failed or was not read to the end, so a partial copy
@@ -146,7 +155,7 @@ impl AlignedSnapshot {
     }
 
     #[cfg(test)]
-    fn mock(outcomes: Vec<Result<()>>, consistent_point: Lsn) -> Self {
+    pub(crate) fn mock(outcomes: Vec<Result<()>>, consistent_point: Lsn) -> Self {
         Self {
             copy: TableCopy::mock(outcomes, consistent_point),
             tables: Vec::new(),

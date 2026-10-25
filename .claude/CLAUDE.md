@@ -82,6 +82,11 @@ Convenience API on top of the core streaming primitives, all `Send + 'static`:
 - `#[derive(WalTable)] #[wal(table = "...")]` (opt-in `derive` feature) + the
   `on_insert_of::<T>/on_update_of::<T>/on_delete_of::<T>` router methods infer the
   table from `T::TABLE`. Derive-using tests are `#[cfg(all(test, feature = "derive"))]`.
+- `next_event_before(C)` (also `next_raw_event_before`, `EventStream::next_event_before`,
+  `EventStreamRef::next_before`, `WalRouter::run_before`) returns `None` before the first
+  transaction committed at or past an `AlignedSnapshot`'s consistent point. It holds that
+  commit's raw frame (peeked by `frame_commit_lsn`, parser untouched) for the next read,
+  or stops on a keepalive `wal_end >= C`. Reconnects and `start()` drop the held frame.
 
 ## Hot Path
 
