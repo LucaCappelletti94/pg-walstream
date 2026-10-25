@@ -19,9 +19,11 @@ use tokio_util::sync::CancellationToken;
 /// The copy contains every transaction whose commit record lies below `C` and
 /// none at or past it, which is what
 /// [`EXPORT_SNAPSHOT`](https://www.postgresql.org/docs/current/logicaldecoding-explanation.html#LOGICALDECODING-EXPLANATION-EXPORTED-SNAPSHOTS)
-/// guarantees. A consumer applies the running stream's transactions committed
-/// below `C` first (a `Begin` whose `final_lsn` is below `C`), then these rows,
-/// then everything from the first transaction committed at or past `C`.
+/// guarantees. A consumer applies the running stream's transactions whose
+/// [`commit_lsn`](crate::EventType::commit_lsn) is below `C` first, then these
+/// rows, then every transaction from the first one committed at or past `C`.
+/// Streamed chunks and `PREPARE` carry no commit position, so a transaction is
+/// applied at its commit event.
 ///
 /// # Cost
 ///
