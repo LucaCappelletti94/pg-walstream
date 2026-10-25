@@ -384,12 +384,13 @@ jobs:
             # libpq-only API surface.
             pg_result_get_bytes) variants=("--no-default-features --features libpq") ;;
             # Server diagnostics and COPY framing are parsed independently by each
-            # backend, so these must prove out on both. `initial_snapshot` joins
-            # them: its COPY-out reader is a hand-rolled state machine over
-            # `wire::read_message` on the native backend and `PQgetCopyData` on
-            # libpq, with nothing shared between the two. Each backend sends
-            # `unread_stream_feedback`'s status update through its own writer.
-            error_classification|upload_manifest|initial_snapshot|require_existing_slot|unread_stream_feedback)
+            # backend, so these must prove out on both. `initial_snapshot` and
+            # `aligned_snapshot` join them: their COPY-out reader is a hand-rolled
+            # state machine over `wire::read_message` on the native backend and
+            # `PQgetCopyData` on libpq, with nothing shared between the two. Each
+            # backend sends `unread_stream_feedback`'s status update through its
+            # own writer.
+            error_classification|upload_manifest|initial_snapshot|require_existing_slot|unread_stream_feedback|aligned_snapshot)
               variants=("" "--no-default-features --features libpq") ;;
             *) variants=("") ;;
           esac

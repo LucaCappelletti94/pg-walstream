@@ -52,7 +52,7 @@ src/
 ├── error.rs         # ReplicationError enum
 ├── lsn.rs           # Thread-safe SharedLsnFeedback (atomic CAS)
 ├── copy_text.rs     # COPY TEXT decoder (crate-private, snapshot only)
-├── snapshot/        # Managed initial snapshot (plan.rs / rows.rs / events.rs)
+├── snapshot/        # Managed initial snapshot (plan.rs / table_copy.rs / rows.rs / events.rs) + aligned.rs (tables added to a running stream)
 ├── sql_builder.rs   # SQL statement builders (CREATE SLOT, etc.)
 ├── retry.rs         # Exponential backoff retry logic
 └── connection/      # PostgreSQL connection backends
