@@ -394,6 +394,7 @@ mod tests {
     #[tokio::test]
     async fn rows_carry_the_consistent_point_and_finish_needs_the_whole_copy() {
         let mut snapshot = AlignedSnapshot::mock(vec![Ok(()), Ok(())], Lsn::new(0x42));
+        assert_eq!(snapshot.consistent_point(), Lsn::new(0x42));
         assert_eq!(
             snapshot.next_row().await.unwrap().unwrap().lsn,
             Lsn::new(0x42)
@@ -424,5 +425,60 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("poisoned"));
+    }
+
+    /// A bound token stops the copy before the next table's `COPY` starts, and the handle cannot then pass for complete.
+    #[tokio::test]
+    async fn a_cancelled_copy_stops_before_the_next_table() {
+        let tables = published(&[("public", "a")]);
+        let token = CancellationToken::new();
+        let mut snapshot = AlignedSnapshot {
+            copy: TableCopy::new(
+                PgReplicationConnection::null_for_testing(),
+                tables.clone(),
+                Lsn::new(1),
+                CancellationToken::new(),
+            ),
+            tables,
+            consistent_point: Lsn::new(1),
+        }
+        .with_cancellation(token.clone());
+        assert_eq!(names(snapshot.tables()), ["public.a"]);
+
+        token.cancel();
+        let err = snapshot.next_row().await.unwrap_err();
+        assert!(err.is_cancelled(), "{err}");
+        assert!(snapshot
+            .finish()
+            .unwrap_err()
+            .to_string()
+            .contains("poisoned"));
+    }
+
+    #[tokio::test]
+    async fn a_capture_that_cannot_reach_the_server_returns_the_connection_error() {
+        let result = AlignedSnapshot::capture(
+            "postgresql://nobody:nothing@127.0.0.1:1/nonexistent?connect_timeout=1",
+            &["p"],
+            &[("public", "a")],
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("nothing listens on port 1"),
+            Err(e) => e,
+        };
+        assert!(!matches!(err, ReplicationError::Config(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn capture_aligned_refuses_a_physical_stream() {
+        let config = crate::stream::ReplicationStreamConfig::builder("s", "p")
+            .with_slot_type(SlotType::Physical);
+        let stream = crate::stream::tests::create_test_stream(config);
+        let err = match stream.capture_aligned(&[("public", "a")]).await {
+            Ok(_) => panic!("a physical stream has no publication to copy through"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, ReplicationError::Config(_)), "{err:?}");
     }
 }
