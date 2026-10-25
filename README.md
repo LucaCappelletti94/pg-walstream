@@ -27,6 +27,7 @@ A high-performance Rust library for PostgreSQL logical and physical replication 
 - **Typed Row Deserialization**: Built-in `serde` deserializer maps WAL rows directly into user-defined Rust structs (numerics, `bool`, `String`, `Option<T>`, enums, bytes)
 - **High-Level Consumption Ergonomics**: `ReplicationStreamConfig::builder()`, an auto-acking `EventStream::for_each_event`, and a typed by-table `WalRouter` with an optional `#[derive(WalTable)]` layer (opt-in `derive` feature)
 - **Managed Initial Snapshot**: `LogicalReplicationStream::snapshot()` copies the published tables through the slot's exported snapshot and hands off to the stream with no gap and no duplicate window. The ordering invariant is enforced by the type system, and snapshot rows arrive as ordinary `ChangeEvent`s, so one set of handlers (or one `WalRouter`) serves both the snapshot and the live stream
+- **Aligned Snapshot**: `LogicalReplicationStream::capture_aligned` copies tables added while the stream runs, exact at a temporary side slot's consistent point, so they merge with the running stream with no gap and no duplicate
 - **Bounded Replay**: `ReplicationStreamConfig::with_stop_at_lsn` streams to a target LSN, delivers the crossing transaction in full, then ends cleanly with `ReplicationError::StreamStopped`
 - **Raw XLogData Access**: `LogicalReplicationStream::next_raw_event` yields the undecoded pgoutput payload plus WAL positions (`RawXLogData`) for consumers that bring their own decoder — keepalives, feedback, and cancellation still handled, no auto-ack
 - **Replication Slot Management**: Create, alter, read, and drop slots with full option support
@@ -293,6 +294,23 @@ A complete, runnable version of the above — including a row inserted *during* 
 > **A failed snapshot cannot be resumed.** The exported snapshot is `REPEATABLE READ`; continuing against an expired one would silently mix rows from two points in time. You own the retry policy; the library owns the retry *start point*, which is always the beginning. A failed or dropped snapshot handle makes a best-effort attempt to drop its slot — a failure to drop is logged, not returned — so a retry normally gets a fresh export instead of finding the slot present and silently proceeding with no baseline.
 
 > **Holding a snapshot handle blocks `VACUUM`.** The handle keeps a `REPEATABLE READ` transaction open, pinning the database's `xmin` — no dead tuple newer than the snapshot can be reclaimed, across the whole database, for as long as you hold it. Copy promptly.
+
+### Tables added while the stream runs
+
+`capture_aligned` copies extra tables through a temporary side slot's exported snapshot, exact at its consistent point `C`. Apply the running stream's transactions committed below `C` first, then the copy, then everything from the first `Begin` whose `final_lsn` is at or past `C`:
+
+```rust
+let mut copy = stream.capture_aligned(&[("public", "orders")]).await?;
+let c = copy.consistent_point();
+// ...keep applying stream transactions whose Begin.final_lsn < c...
+while let Some(row) = copy.next_row().await? {
+    sink.load(row).await?;
+}
+copy.finish()?;
+// ...then every transaction from the first Begin.final_lsn >= c on.
+```
+
+The capture briefly holds a second replication connection and a temporary slot, waits for transactions open at that moment to end, and pins `xmin` until `finish()`.
 
 ## Connection Timeouts
 
