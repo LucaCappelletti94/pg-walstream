@@ -142,105 +142,176 @@ fn no_aligned_slot_left() -> bool {
     })
 }
 
-/// With inserts, updates and deletes committing on both sides of `C`, the copy
-/// plus the stream's transactions committed at or past `C` reproduce the table
-/// with every change applied exactly once.
+/// A running stream at `B`, a writer committing inserts, updates and deletes to
+/// `{prefix}_new` and `{prefix}_old` across a capture of `{prefix}_new`, and a
+/// sentinel row in `{prefix}_old` after the writer stopped.
+struct Race {
+    _guard: SlotGuard,
+    admin: PgReplicationConnection,
+    stream: LogicalReplicationStream,
+    cancel: CancellationToken,
+    prefix: &'static str,
+    c: Lsn,
+    copy: BTreeMap<i64, String>,
+    /// The rows at `B`, before any change the writer made.
+    at_b: BTreeMap<i64, String>,
+}
+
+async fn race(prefix: &'static str, slot: &'static str) -> Race {
+    let guard = slot_guard(slot);
+    let mut admin = regular_conn();
+    for sql in [
+        format!("DROP PUBLICATION IF EXISTS {prefix}_pub"),
+        format!("DROP TABLE IF EXISTS {prefix}_old, {prefix}_new"),
+        format!("CREATE TABLE {prefix}_old (id bigint PRIMARY KEY, v text NOT NULL)"),
+        format!("CREATE TABLE {prefix}_new (id bigint PRIMARY KEY, v text NOT NULL)"),
+        format!("CREATE PUBLICATION {prefix}_pub FOR TABLE {prefix}_old, {prefix}_new"),
+    ] {
+        exec(&mut admin, &sql);
+    }
+
+    let mut stream = running_stream(slot, &format!("{prefix}_pub")).await;
+    let cancel = CancellationToken::new();
+
+    for id in 1..=20 {
+        exec(
+            &mut admin,
+            &format!("INSERT INTO {prefix}_new VALUES ({id}, 'b')"),
+        );
+    }
+    let mut delivered = 0;
+    while delivered < 20 {
+        if let EventType::Insert { .. } = stream.next_event(&cancel).await.unwrap().event_type {
+            delivered += 1;
+        }
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut w = regular_conn();
+            let mut id = 1000_i64;
+            while !stop.load(Ordering::Relaxed) {
+                exec(
+                    &mut w,
+                    &format!("INSERT INTO {prefix}_new VALUES ({id}, 'w')"),
+                );
+                exec(
+                    &mut w,
+                    &format!("INSERT INTO {prefix}_old VALUES ({id}, 'w')"),
+                );
+                if id % 3 == 0 {
+                    exec(
+                        &mut w,
+                        &format!("UPDATE {prefix}_new SET v = v || 'u' WHERE id = {}", id - 1),
+                    );
+                }
+                if id % 5 == 0 {
+                    exec(
+                        &mut w,
+                        &format!("DELETE FROM {prefix}_new WHERE id = {}", id - 3),
+                    );
+                }
+                id += 1;
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut snapshot = stream
+        .capture_aligned(&[("public", &format!("{prefix}_new"))])
+        .await
+        .expect("capture");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    exec(
+        &mut admin,
+        &format!("INSERT INTO {prefix}_old VALUES (-1, 'sentinel')"),
+    );
+
+    let c = snapshot.consistent_point();
+    assert_eq!(snapshot.tables().len(), 1);
+    let mut copy = BTreeMap::new();
+    while let Some(row) = snapshot.next_row().await.unwrap() {
+        assert_eq!(row.lsn, c);
+        assert!(copy.insert(id(&row.data), text(&row.data, "v")).is_none());
+    }
+    snapshot.finish().unwrap();
+    assert!(
+        no_aligned_slot_left(),
+        "the temporary side slot outlived the capture"
+    );
+
+    Race {
+        _guard: guard,
+        admin,
+        stream,
+        cancel,
+        prefix,
+        c,
+        copy,
+        at_b: (1..=20).map(|id| (id, "b".to_string())).collect(),
+    }
+}
+
+/// What one stream event means for the race.
+enum Step {
+    /// A change to `{prefix}_new`: row, new value or `None` for a delete, and whether the row must already exist.
+    Change(i64, Option<String>, bool),
+    Sentinel,
+    Other,
+}
+
+fn step(event: EventType, prefix: &str) -> Step {
+    let (old, new) = (format!("{prefix}_old"), format!("{prefix}_new"));
+    match event {
+        EventType::Insert { table, data, .. } if *table == *old && id(&data) == -1 => {
+            Step::Sentinel
+        }
+        EventType::Insert { table, data, .. } if *table == *new => {
+            Step::Change(id(&data), Some(text(&data, "v")), false)
+        }
+        EventType::Update {
+            table, new_data, ..
+        } if *table == *new => Step::Change(id(&new_data), Some(text(&new_data, "v")), true),
+        EventType::Delete {
+            table, old_data, ..
+        } if *table == *new => Step::Change(id(&old_data), None, true),
+        _ => Step::Other,
+    }
+}
+
+fn apply(state: &mut BTreeMap<i64, String>, row: i64, value: &Option<String>, must_exist: bool) {
+    let previous = match value {
+        Some(v) => state.insert(row, v.clone()),
+        None => state.remove(&row),
+    };
+    assert_eq!(
+        previous.is_some(),
+        must_exist,
+        "row {row} applied out of step"
+    );
+}
+
+/// With changes committing on both sides of `C`, the stream replayed to `C`
+/// reproduces the copy, and the copy plus every transaction whose
+/// `commit_lsn()` is at or past `C` reproduces the table, each change once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a live PostgreSQL with wal_level = logical"]
 async fn copy_and_stream_split_at_the_consistent_point_apply_every_change_once() {
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let _guard = slot_guard("aligned_split_main");
-        let mut admin = regular_conn();
-        for sql in [
-            "DROP PUBLICATION IF EXISTS aligned_split_pub",
-            "DROP TABLE IF EXISTS aligned_split_old, aligned_split_new",
-            "CREATE TABLE aligned_split_old (id bigint PRIMARY KEY, v text NOT NULL)",
-            "CREATE TABLE aligned_split_new (id bigint PRIMARY KEY, v text NOT NULL)",
-            "CREATE PUBLICATION aligned_split_pub FOR TABLE aligned_split_old, aligned_split_new",
-        ] {
-            exec(&mut admin, sql);
-        }
+        let Race {
+            _guard,
+            mut admin,
+            mut stream,
+            cancel,
+            prefix,
+            c,
+            mut copy,
+            mut at_b,
+        } = race("aligned_split", "aligned_split_main").await;
 
-        let mut stream = running_stream("aligned_split_main", "aligned_split_pub").await;
-        let cancel = CancellationToken::new();
-
-        // Position B: a first batch, fully delivered.
-        for id in 1..=20 {
-            exec(
-                &mut admin,
-                &format!("INSERT INTO aligned_split_new VALUES ({id}, 'b')"),
-            );
-        }
-        let mut delivered = 0;
-        while delivered < 20 {
-            if let EventType::Insert { .. } = stream.next_event(&cancel).await.unwrap().event_type {
-                delivered += 1;
-            }
-        }
-
-        // One transaction per statement, across both tables, until stopped.
-        let stop = Arc::new(AtomicBool::new(false));
-        let writer = {
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                let mut w = regular_conn();
-                let mut id = 1000_i64;
-                while !stop.load(Ordering::Relaxed) {
-                    exec(
-                        &mut w,
-                        &format!("INSERT INTO aligned_split_new VALUES ({id}, 'w')"),
-                    );
-                    exec(
-                        &mut w,
-                        &format!("INSERT INTO aligned_split_old VALUES ({id}, 'w')"),
-                    );
-                    if id % 3 == 0 {
-                        exec(
-                            &mut w,
-                            &format!(
-                                "UPDATE aligned_split_new SET v = v || 'u' WHERE id = {}",
-                                id - 1
-                            ),
-                        );
-                    }
-                    if id % 5 == 0 {
-                        exec(
-                            &mut w,
-                            &format!("DELETE FROM aligned_split_new WHERE id = {}", id - 3),
-                        );
-                    }
-                    id += 1;
-                }
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let mut snapshot = stream
-            .capture_aligned(&[("public", "aligned_split_new")])
-            .await
-            .expect("capture");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        stop.store(true, Ordering::Relaxed);
-        writer.join().unwrap();
-        exec(
-            &mut admin,
-            "INSERT INTO aligned_split_old VALUES (-1, 'sentinel')",
-        );
-
-        let c = snapshot.consistent_point();
-        assert_eq!(snapshot.tables().len(), 1);
-        let mut copy = BTreeMap::new();
-        while let Some(row) = snapshot.next_row().await.unwrap() {
-            assert_eq!(row.lsn, c);
-            assert!(copy.insert(id(&row.data), text(&row.data, "v")).is_none());
-        }
-        snapshot.finish().unwrap();
-        assert!(
-            no_aligned_slot_left(),
-            "the temporary side slot outlived the capture"
-        );
-
-        // `replay` folds every change from B on; below C it must reproduce the copy exactly.
-        let mut replay: BTreeMap<i64, String> = (1..=20).map(|id| (id, "b".to_string())).collect();
         let mut commit_lsn = Lsn::new(0);
         let (mut below, mut at_or_after) = (0, 0);
         let mut crossed = false;
@@ -250,51 +321,22 @@ async fn copy_and_stream_split_at_the_consistent_point_apply_every_change_once()
                 commit_lsn = commit;
                 if commit >= c && !crossed {
                     crossed = true;
-                    assert_eq!(
-                        replay, copy,
-                        "the copy differs from the stream replayed to C"
-                    );
+                    assert_eq!(at_b, copy, "the copy differs from the stream replayed to C");
                 }
                 continue;
             }
-            let change = match event {
-                EventType::Insert { table, data, .. } if &*table == "aligned_split_old" => {
-                    if id(&data) == -1 {
-                        break;
+            match step(event, prefix) {
+                Step::Sentinel => break,
+                Step::Other => {}
+                Step::Change(row, value, must_exist) => {
+                    apply(&mut at_b, row, &value, must_exist);
+                    if commit_lsn < c {
+                        below += 1;
+                    } else {
+                        at_or_after += 1;
+                        apply(&mut copy, row, &value, must_exist);
                     }
-                    continue;
                 }
-                EventType::Insert { table, data, .. } if &*table == "aligned_split_new" => {
-                    (id(&data), Some(text(&data, "v")), false)
-                }
-                EventType::Update {
-                    table, new_data, ..
-                } if &*table == "aligned_split_new" => {
-                    (id(&new_data), Some(text(&new_data, "v")), true)
-                }
-                EventType::Delete {
-                    table, old_data, ..
-                } if &*table == "aligned_split_new" => (id(&old_data), None, true),
-                _ => continue,
-            };
-            let (row, value, must_exist) = change;
-            let apply = |state: &mut BTreeMap<i64, String>| {
-                let previous = match &value {
-                    Some(v) => state.insert(row, v.clone()),
-                    None => state.remove(&row),
-                };
-                assert_eq!(
-                    previous.is_some(),
-                    must_exist,
-                    "row {row} applied out of step"
-                );
-            };
-            apply(&mut replay);
-            if commit_lsn < c {
-                below += 1;
-            } else {
-                at_or_after += 1;
-                apply(&mut copy);
             }
         }
 
@@ -303,7 +345,112 @@ async fn copy_and_stream_split_at_the_consistent_point_apply_every_change_once()
             "no change committed between B and C, the overlap was not exercised"
         );
         assert!(crossed && at_or_after > 0, "no change committed after C");
-        assert_eq!(copy, table_state(&mut admin, "aligned_split_new"));
+        assert_eq!(copy, table_state(&mut admin, &format!("{prefix}_new")));
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// `next_event_before(C)` delivers exactly the transactions committed below
+/// `C`, and the following reads deliver the rest, so applying the copy at the
+/// `None` reproduces the table with each change once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a live PostgreSQL with wal_level = logical"]
+async fn next_event_before_stops_the_stream_where_the_copy_applies() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let Race {
+            _guard,
+            mut admin,
+            mut stream,
+            cancel,
+            prefix,
+            c,
+            mut copy,
+            mut at_b,
+        } = race("aligned_barrier", "aligned_barrier_main").await;
+
+        let mut below = 0;
+        while let Some(event) = stream.next_event_before(c, &cancel).await.unwrap() {
+            if let Some(commit) = event.event_type.commit_lsn() {
+                assert!(commit < c, "a commit at or past C crossed the barrier");
+            }
+            if let Step::Change(row, value, must_exist) = step(event.event_type, prefix) {
+                apply(&mut at_b, row, &value, must_exist);
+                below += 1;
+            }
+        }
+        assert!(
+            below > 0,
+            "no change committed between B and C, the overlap was not exercised"
+        );
+        assert_eq!(
+            at_b, copy,
+            "the stream stopped somewhere other than the copy's point"
+        );
+
+        let mut first_commit = None;
+        let mut after = 0;
+        loop {
+            let event = stream.next_event(&cancel).await.unwrap().event_type;
+            if let Some(commit) = event.commit_lsn() {
+                first_commit.get_or_insert(commit);
+                continue;
+            }
+            match step(event, prefix) {
+                Step::Sentinel => break,
+                Step::Other => {}
+                Step::Change(row, value, must_exist) => {
+                    apply(&mut copy, row, &value, must_exist);
+                    after += 1;
+                }
+            }
+        }
+        assert!(first_commit.is_some_and(|commit| commit >= c));
+        assert!(after > 0, "no change committed after C");
+        assert_eq!(copy, table_state(&mut admin, &format!("{prefix}_new")));
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// With nothing published after `C`, the walsender's keepalive ends the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a live PostgreSQL with wal_level = logical"]
+async fn a_keepalive_ends_the_wait_when_no_published_commit_follows() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let _guard = slot_guard("aligned_idle_main");
+        let mut admin = regular_conn();
+        for sql in [
+            "DROP PUBLICATION IF EXISTS aligned_idle_pub",
+            "DROP TABLE IF EXISTS aligned_idle, aligned_idle_other",
+            "CREATE TABLE aligned_idle (id bigint PRIMARY KEY, v text NOT NULL)",
+            "CREATE TABLE aligned_idle_other (id bigint PRIMARY KEY)",
+            "INSERT INTO aligned_idle VALUES (1, 'a')",
+            "CREATE PUBLICATION aligned_idle_pub FOR TABLE aligned_idle",
+        ] {
+            exec(&mut admin, sql);
+        }
+
+        let stream = running_stream("aligned_idle_main", "aligned_idle_pub").await;
+        let mut copy = stream
+            .capture_aligned(&[("public", "aligned_idle")])
+            .await
+            .expect("capture");
+        let c = copy.consistent_point();
+        exec(&mut admin, "INSERT INTO aligned_idle_other VALUES (1)");
+
+        let mut events = stream.into_stream(CancellationToken::new());
+        let reached = tokio::time::timeout(Duration::from_secs(30), events.next_event_before(c))
+            .await
+            .expect("the boundary was never reported");
+        assert!(reached.unwrap().is_none());
+
+        let mut rows = 0;
+        while copy.next_row().await.unwrap().is_some() {
+            rows += 1;
+        }
+        copy.finish().unwrap();
+        assert_eq!(rows, 1);
     })
     .await
     .expect("test timed out");
