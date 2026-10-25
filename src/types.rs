@@ -726,6 +726,26 @@ pub enum EventType {
     },
 }
 
+impl EventType {
+    /// The commit position of the transaction this event opens or commits:
+    /// `Begin`'s `final_lsn`, or the `commit_lsn` of `Commit`, `StreamCommit`
+    /// and `CommitPrepared`.
+    ///
+    /// This is the position an [`AlignedSnapshot`](crate::AlignedSnapshot)
+    /// splits a running stream at, since its copy holds exactly the
+    /// transactions whose commit position lies below its consistent point.
+    #[inline]
+    pub fn commit_lsn(&self) -> Option<Lsn> {
+        match self {
+            EventType::Begin { final_lsn, .. } => Some(*final_lsn),
+            EventType::Commit { commit_lsn, .. }
+            | EventType::StreamCommit { commit_lsn, .. }
+            | EventType::CommitPrepared { commit_lsn, .. } => Some(*commit_lsn),
+            _ => None,
+        }
+    }
+}
+
 /// Lightweight representation of a column in a relation (table schema).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelationColumn {
@@ -3324,6 +3344,75 @@ mod tests {
         let debug = format!("{event:?}");
         assert!(debug.contains("Insert"), "got: {debug}");
         assert!(debug.contains("Lsn"), "got: {debug}");
+    }
+
+    /// Commit-carrying events report the commit position, never `end_lsn`, and nothing else reports one.
+    #[test]
+    fn commit_lsn_is_the_commit_position_of_commit_carrying_events_only() {
+        let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let (commit, end) = (Lsn::new(0x100), Lsn::new(0x200));
+        let with_commit = [
+            EventType::Begin {
+                transaction_id: 7,
+                final_lsn: commit,
+                commit_timestamp: ts,
+            },
+            EventType::Commit {
+                commit_timestamp: ts,
+                commit_lsn: commit,
+                end_lsn: end,
+            },
+            EventType::StreamCommit {
+                transaction_id: 7,
+                commit_lsn: commit,
+                end_lsn: end,
+                commit_timestamp: ts,
+            },
+            EventType::CommitPrepared {
+                flags: 0,
+                transaction_id: 7,
+                commit_lsn: commit,
+                end_lsn: end,
+                commit_timestamp: ts,
+                gid: Arc::from("g"),
+            },
+        ];
+        for event in &with_commit {
+            assert_eq!(event.commit_lsn(), Some(commit), "{event:?}");
+        }
+
+        let without_commit = [
+            EventType::StreamStart {
+                transaction_id: 7,
+                first_segment: true,
+            },
+            EventType::Prepare {
+                flags: 0,
+                transaction_id: 7,
+                prepare_lsn: commit,
+                end_lsn: end,
+                prepare_timestamp: ts,
+                gid: Arc::from("g"),
+            },
+            EventType::RollbackPrepared {
+                flags: 0,
+                transaction_id: 7,
+                prepare_end_lsn: commit,
+                rollback_end_lsn: end,
+                prepare_timestamp: ts,
+                rollback_timestamp: ts,
+                gid: Arc::from("g"),
+            },
+            EventType::StreamAbort {
+                transaction_id: 7,
+                subtransaction_xid: 7,
+                abort_lsn: Some(commit),
+                abort_timestamp: None,
+            },
+        ];
+        for event in &without_commit {
+            assert_eq!(event.commit_lsn(), None, "{event:?}");
+        }
     }
 
     #[test]
