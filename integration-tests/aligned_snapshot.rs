@@ -241,14 +241,14 @@ async fn copy_and_stream_split_at_the_consistent_point_apply_every_change_once()
 
         // `replay` folds every change from B on; below C it must reproduce the copy exactly.
         let mut replay: BTreeMap<i64, String> = (1..=20).map(|id| (id, "b".to_string())).collect();
-        let mut final_lsn = Lsn::new(0);
+        let mut commit_lsn = Lsn::new(0);
         let (mut below, mut at_or_after) = (0, 0);
         let mut crossed = false;
         loop {
             let event = stream.next_event(&cancel).await.unwrap().event_type;
-            if let EventType::Begin { final_lsn: f, .. } = event {
-                final_lsn = f;
-                if f >= c && !crossed {
+            if let Some(commit) = event.commit_lsn() {
+                commit_lsn = commit;
+                if commit >= c && !crossed {
                     crossed = true;
                     assert_eq!(
                         replay, copy,
@@ -290,7 +290,7 @@ async fn copy_and_stream_split_at_the_consistent_point_apply_every_change_once()
                 );
             };
             apply(&mut replay);
-            if final_lsn < c {
+            if commit_lsn < c {
                 below += 1;
             } else {
                 at_or_after += 1;
