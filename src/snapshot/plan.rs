@@ -379,19 +379,28 @@ fn unique_row_filter(group: &[CatalogRow]) -> Result<Option<String>> {
 /// too — and the derived string agreeing with what libpq will actually parse
 /// matters more than being right in the abstract.
 pub(super) fn derive_reader_conninfo(conninfo: &str) -> String {
+    with_replication(conninfo, "false")
+}
+
+/// Derive a replication connection string, whether or not `conninfo` asks for one.
+pub(super) fn derive_side_conninfo(conninfo: &str) -> String {
+    with_replication(conninfo, "database")
+}
+
+fn with_replication(conninfo: &str, value: &str) -> String {
     let trimmed = conninfo.trim_start();
     let is_uri = trimmed.starts_with("postgresql://") || trimmed.starts_with("postgres://");
 
     if is_uri {
         match conninfo.find('?') {
             // A URI ending in a bare `?` has an empty query string; appending
-            // `&replication=false` there would leave a leading empty parameter.
-            Some(_) if conninfo.ends_with('?') => format!("{conninfo}replication=false"),
-            Some(_) => format!("{conninfo}&replication=false"),
-            None => format!("{conninfo}?replication=false"),
+            // `&replication=...` there would leave a leading empty parameter.
+            Some(_) if conninfo.ends_with('?') => format!("{conninfo}replication={value}"),
+            Some(_) => format!("{conninfo}&replication={value}"),
+            None => format!("{conninfo}?replication={value}"),
         }
     } else {
-        format!("{conninfo} replication=false")
+        format!("{conninfo} replication={value}")
     }
 }
 
@@ -943,6 +952,26 @@ mod tests {
                 parsed.replication,
                 ReplicationMode::None,
                 "last occurrence must win for {derived}"
+            );
+        }
+    }
+
+    /// A plain or replication connection string both yield a replication session for the side slot.
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn side_conninfo_parses_to_replication_database() {
+        use crate::connection::native::conninfo::{ConnInfo, ReplicationMode};
+
+        for base in [
+            "postgresql://u:p@h:5432/db",
+            "postgresql://u:p@h:5432/db?replication=false",
+            "host=h port=5432 dbname=db",
+        ] {
+            let derived = derive_side_conninfo(base);
+            let parsed = ConnInfo::parse(&derived).unwrap();
+            assert!(
+                matches!(parsed.replication, ReplicationMode::Database),
+                "{derived}"
             );
         }
     }
