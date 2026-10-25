@@ -55,8 +55,10 @@ src/
 ├── copy_text.rs     # COPY TEXT decoder (crate-private; snapshot only)
 ├── snapshot/        # managed initial snapshot — see below
 │   ├── plan.rs      #   catalog query, COPY SQL, reader conninfo (all pure)
-│   ├── rows.rs      #   SnapshotRows: the one implementation
-│   └── events.rs    #   SnapshotEvents: ChangeEvent adapter + EventSource impl
+│   ├── table_copy.rs #  TableCopy: the COPY row loop both handles share
+│   ├── rows.rs      #   SnapshotRows: the slot-owning handle
+│   ├── events.rs    #   SnapshotEvents: ChangeEvent adapter + EventSource impl
+│   └── aligned.rs   #   AlignedSnapshot: tables added to a running stream (side slot)
 └── connection/      # native/ rustls-tls backend (default) + libpq FFI backend (opt-in)
     └── native/copy_out.rs   # CopyOut state machine (NOT copy.rs — see below)
 macros/              # #[derive(WalTable)] (opt-in `derive` feature)

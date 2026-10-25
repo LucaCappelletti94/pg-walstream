@@ -14,6 +14,7 @@
 //! A snapshot helper, not table sync. No resumable or chunked snapshots, no
 //! multi-worker sync, no progress persistence. A failure means starting over;
 //! the caller owns retry policy, the library owns the retry *start point*.
+//! Tables added while a stream already runs are copied by [`AlignedSnapshot`].
 //!
 //! # Cost of holding a handle
 //!
@@ -69,9 +70,11 @@
 
 // Private: the snapshot API is the supported surface. The types callers touch
 // are re-exported below, so the module layout stays free to change.
+mod aligned;
 mod events;
 mod plan;
 mod rows;
+mod table_copy;
 
 use crate::connection::PgReplicationConnection;
 use crate::error::{ReplicationError, Result};
@@ -86,6 +89,7 @@ use tokio_util::sync::CancellationToken;
 const SNAPSHOT_TAKEN: &str =
     "the stream and reader are moved out only by rows(), which consumes self";
 
+pub use aligned::AlignedSnapshot;
 pub use events::SnapshotEvents;
 pub use plan::SnapshotTable;
 pub use rows::{SnapshotRow, SnapshotRows};
