@@ -185,6 +185,10 @@ path = "integration-tests/error_classification.rs"
 name = "upload_manifest"
 path = "integration-tests/upload_manifest.rs"
 
+[[test]]
+name = "require_existing_slot"
+path = "integration-tests/require_existing_slot.rs"
+
 [[bench]]
 name = "wal_pipeline"
 harness = false
