@@ -252,6 +252,8 @@ pub struct ReplicationStreamConfig {
     pub retry_config: RetryConfig,
     pub slot_options: ReplicationSlotOptions,
     pub slot_type: SlotType,
+    /// Disable automatic slot creation on start and recovery when `true` (default `false`).
+    pub existing_slot_required: bool,
     /// Bounded replay: stop after the transaction whose commit `end_lsn` reaches this LSN. `None` (the default) streams unbounded.
     pub stop_at_lsn: Option<Lsn>,
 }
@@ -361,6 +363,7 @@ impl ReplicationStreamConfig {
             },
             slot_type: SlotType::Logical,
             stop_at_lsn: None,
+            existing_slot_required: false,
         }
     }
 
@@ -457,6 +460,21 @@ impl ReplicationStreamConfig {
         self
     }
 
+    /// Require an existing slot on start and recovery (`false` by default), leaving explicit [`ensure_replication_slot`](LogicalReplicationStream::ensure_replication_slot) and [`snapshot`](LogicalReplicationStream::snapshot) provisioning available.
+    ///
+    /// ```
+    /// use pg_walstream::ReplicationStreamConfig;
+    ///
+    /// let config = ReplicationStreamConfig::builder("my_slot", "my_publication")
+    ///     .with_existing_slot_required(true);
+    /// assert!(config.existing_slot_required);
+    /// ```
+    #[inline]
+    pub fn with_existing_slot_required(mut self, required: bool) -> Self {
+        self.existing_slot_required = required;
+        self
+    }
+
     /// Set the replication slot type (default: `SlotType::Logical`)
     ///
     /// Use `SlotType::Physical` for physical replication slots that stream raw WAL data without logical decoding.
@@ -488,6 +506,7 @@ impl Default for ReplicationStreamConfig {
             },
             slot_type: SlotType::Logical,
             stop_at_lsn: None,
+            existing_slot_required: false,
         }
     }
 }
@@ -672,11 +691,18 @@ impl LogicalReplicationStream {
         self.identity = ServerIdentity::from_identify_system(&identity);
         info!("System identification successful");
 
-        // Create replication slot if it doesn't exist
-        self.ensure_replication_slot().await?;
+        self.prepare_replication_slot().await?;
 
         info!("Replication stream initialized");
         Ok(())
+    }
+
+    async fn prepare_replication_slot(&mut self) -> Result<()> {
+        if self.config.existing_slot_required {
+            Ok(())
+        } else {
+            self.ensure_replication_slot().await
+        }
     }
 
     /// Ensure the replication slot exists, creating it if necessary.
@@ -763,8 +789,8 @@ impl LogicalReplicationStream {
 
     /// Start the replication stream
     ///
-    /// This initializes the replication slot (creating it if necessary) and begins
-    /// streaming changes from PostgreSQL.    ///
+    /// Creates a missing slot unless [`existing_slot_required`](ReplicationStreamConfig::existing_slot_required) is enabled, then starts streaming.
+    ///
     /// # Arguments
     ///
     /// * `start_lsn` - Optional LSN to start replication from. If `None`, starts from
@@ -780,6 +806,7 @@ impl LogicalReplicationStream {
     /// - System identification fails
     /// - Replication slot creation fails (if it doesn't exist)
     /// - Starting replication command fails
+    /// - The slot is missing and [`existing_slot_required`](ReplicationStreamConfig::existing_slot_required) is enabled, yielding [`ReplicationError::ReplicationSlot`]
     ///
     /// # Example
     ///
@@ -830,6 +857,10 @@ impl LogicalReplicationStream {
             .collect::<Vec<_>>();
         self.connection
             .start_replication(&self.config.slot_name, start_lsn, &options_ref)?;
+
+        if !self.slot.is_present() {
+            self.slot = SlotState::PreExisting;
+        }
 
         self.slot.clear_exported_snapshot();
 
@@ -1140,14 +1171,12 @@ impl LogicalReplicationStream {
             }
         }
 
-        // Temporary slots are dropped when the connection dies, so we must
-        // recreate them on recovery.
+        // Temporary slots are dropped when the connection dies.
         if self.config.slot_options.temporary {
             self.slot = SlotState::Absent;
         }
 
-        // Ensure replication slot still exists (recreate if temporary)
-        self.ensure_replication_slot().await?;
+        self.prepare_replication_slot().await?;
 
         // Restart position for the reconnect.
         //
@@ -1758,8 +1787,7 @@ impl LogicalReplicationStream {
 
     /// Returns `true` if this stream's replication slot is configured as temporary.
     ///
-    /// Temporary slots are automatically dropped when the replication connection
-    /// is closed. This means that on reconnection, the slot will be recreated.
+    /// Temporary slots are dropped on disconnect and recreated on recovery unless [`existing_slot_required`](ReplicationStreamConfig::existing_slot_required) is enabled.
     pub fn is_temporary_slot(&self) -> bool {
         self.config.slot_options.temporary
     }
@@ -2712,6 +2740,55 @@ pub(crate) mod tests {
         assert_eq!(config.connection_timeout, Duration::from_secs(30));
         assert_eq!(config.health_check_interval, Duration::from_secs(60));
         assert!(matches!(config.slot_type, SlotType::Logical));
+    }
+
+    #[test]
+    fn existing_slot_requirement_defaults_to_false() {
+        for config in [
+            ReplicationStreamConfig::default(),
+            ReplicationStreamConfig::builder("slot", "pub"),
+            create_test_config(),
+        ] {
+            assert!(!config.existing_slot_required);
+        }
+    }
+
+    #[test]
+    fn existing_slot_requirement_can_be_enabled_and_disabled() {
+        let config =
+            ReplicationStreamConfig::builder("slot", "pub").with_existing_slot_required(true);
+        assert!(config.existing_slot_required);
+        assert!(
+            !config
+                .with_existing_slot_required(false)
+                .existing_slot_required
+        );
+    }
+
+    #[tokio::test]
+    async fn requiring_an_existing_slot_leaves_validation_to_start_replication() {
+        let config = create_test_config().with_existing_slot_required(true);
+        let mut stream = create_test_stream(config);
+        stream
+            .prepare_replication_slot()
+            .await
+            .expect("automatic slot creation is disabled");
+        assert!(matches!(stream.slot, SlotState::Absent));
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test]
+    async fn automatic_slot_creation_reports_connection_errors() {
+        let mut stream = create_test_stream(create_test_config());
+        let error = stream
+            .prepare_replication_slot()
+            .await
+            .expect_err("creating a slot needs a live connection");
+        assert!(
+            matches!(error, ReplicationError::TransientConnection(_)),
+            "{error:?}"
+        );
+        assert!(matches!(stream.slot, SlotState::Absent));
     }
 
     #[tokio::test]
