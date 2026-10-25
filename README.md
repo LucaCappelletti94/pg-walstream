@@ -347,7 +347,7 @@ GRANT USAGE ON SCHEMA public TO replication_user;
 
 ### 4. Replication Slot Options
 
-The library provides full control over replication slot creation. The correct SQL syntax is automatically selected based on the connected PostgreSQL version:
+`start()` creates missing slots by default. Set `ReplicationStreamConfig::with_existing_slot_required(true)` to refuse automatic creation on startup and recovery, while explicit `ensure_replication_slot()` and `snapshot()` can still create slots. Slot creation SQL follows the connected PostgreSQL version.
 - **PG14**: Legacy positional keyword syntax (`EXPORT_SNAPSHOT`, `NOEXPORT_SNAPSHOT`, `USE_SNAPSHOT`, `TWO_PHASE`, `RESERVE_WAL`)
 - **PG15+**: Modern parenthesized options syntax (`(SNAPSHOT 'export', TWO_PHASE true, ...)`)
 
