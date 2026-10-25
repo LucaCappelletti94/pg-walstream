@@ -88,9 +88,7 @@ enum SlotState {
 }
 
 impl SlotState {
-    /// True once a usable slot exists, however it got there. This is the old
-    /// `slot_created` predicate, and the only question `ensure_replication_slot`
-    /// needs to answer.
+    /// Whether this stream knows that a usable slot exists.
     #[inline]
     fn is_present(&self) -> bool {
         !matches!(self, SlotState::Absent)
@@ -306,7 +304,7 @@ impl ReplicationStreamConfig {
     ///
     /// # Arguments
     ///
-    /// * `slot_name` - Name of the replication slot to use (will be created if it doesn't exist)
+    /// * `slot_name` - Name of the replication slot to use (created on start unless `existing_slot_required` is set)
     /// * `publication_name` - Name of the PostgreSQL publication to replicate from
     /// * `protocol_version` - Protocol version (1-4). Version 2+ supports streaming transactions
     /// * `streaming_mode` - Streaming mode for logical decoding (off/on/parallel).
@@ -804,7 +802,7 @@ impl LogicalReplicationStream {
     ///
     /// Returns an error if:
     /// - System identification fails
-    /// - Replication slot creation fails (if it doesn't exist)
+    /// - Replication slot creation fails (only when automatic creation is enabled)
     /// - Starting replication command fails
     /// - The slot is missing and [`existing_slot_required`](ReplicationStreamConfig::existing_slot_required) is enabled, yielding [`ReplicationError::ReplicationSlot`]
     ///

@@ -369,7 +369,7 @@ jobs:
             # them: its COPY-out reader is a hand-rolled state machine over
             # `wire::read_message` on the native backend and `PQgetCopyData` on
             # libpq, with nothing shared between the two.
-            error_classification|upload_manifest|initial_snapshot)
+            error_classification|upload_manifest|initial_snapshot|require_existing_slot)
               variants=("" "--no-default-features --features libpq") ;;
             *) variants=("") ;;
           esac
