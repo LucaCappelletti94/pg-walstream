@@ -2,8 +2,8 @@
 //! client-ergonomics design.
 
 use crate::error::{ReplicationError, Result};
-use crate::stream::{EventSource, EventStream};
-use crate::types::{ChangeEvent, EventType};
+use crate::stream::{BoundedEventSource, EventSource, EventStream};
+use crate::types::{ChangeEvent, EventType, Lsn};
 use core::future::Future;
 use core::pin::Pin;
 use std::collections::HashMap;
@@ -167,6 +167,41 @@ impl WalRouter {
     /// after each `Ok`, and exit gracefully on cancellation.
     pub async fn run(&mut self, es: &mut EventStream) -> Result<()> {
         self.run_over(es).await
+    }
+
+    /// Drive an [`EventStream`] up to `boundary` with
+    /// [`EventStream::next_event_before`], acknowledging each event after its
+    /// handler.
+    ///
+    /// Returns `Ok(())` only at the boundary. Cancellation is an error here, so
+    /// it cannot be mistaken for having reached the boundary.
+    pub async fn run_before(&mut self, es: &mut EventStream, boundary: Lsn) -> Result<()> {
+        self.run_before_over(es, boundary).await
+    }
+
+    async fn run_before_over<S: BoundedEventSource>(
+        &mut self,
+        source: &mut S,
+        boundary: Lsn,
+    ) -> Result<()> {
+        while let Some(ev) = source.recv_before(boundary).await? {
+            let lsn = ev.lsn.value();
+            self.dispatch(&ev).await?;
+            source.ack(lsn);
+        }
+        Ok(())
+    }
+
+    /// Dispatch every row of an [`AlignedSnapshot`](crate::AlignedSnapshot) as
+    /// an `Insert` to the same handlers, then follow with
+    /// [`finish`](crate::AlignedSnapshot::finish).
+    ///
+    /// Cancellation of the copy is an error, as in [`run_before`](Self::run_before).
+    pub async fn run_aligned(&mut self, snapshot: &mut crate::AlignedSnapshot) -> Result<()> {
+        while let Some(ev) = snapshot.next_event().await? {
+            self.dispatch(&ev).await?;
+        }
+        Ok(())
     }
 
     /// Generic driver over any [`EventSource`] (unit-testable seam).
@@ -534,5 +569,88 @@ mod tests {
         router.on_insert::<Row, _, _>("users", |_r| async { Ok(()) });
         // "id" = "abc" is not an i64 → deserialize_insert fails inside the wrapper.
         assert!(router.dispatch(&ins("users", "abc", 1)).await.is_err());
+    }
+
+    /// A boundary-stopping source whose script ends with `None` at the boundary.
+    struct MockBounded {
+        events: VecDeque<Result<Option<ChangeEvent>>>,
+        last_ack: AtomicU64,
+    }
+    impl EventSource for MockBounded {
+        async fn recv(&mut self) -> Result<ChangeEvent> {
+            unreachable!("run_before reads only through recv_before")
+        }
+        fn ack(&self, lsn: XLogRecPtr) {
+            self.last_ack.store(lsn, Ordering::Relaxed);
+        }
+    }
+    impl BoundedEventSource for MockBounded {
+        async fn recv_before(&mut self, _boundary: Lsn) -> Result<Option<ChangeEvent>> {
+            self.events.pop_front().expect("script ran out")
+        }
+    }
+
+    #[tokio::test]
+    async fn run_before_dispatches_and_acks_up_to_the_boundary() {
+        let seen = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let s = seen.clone();
+        let mut router = WalRouter::new();
+        router.on_insert::<Row, _, _>("users", move |r| {
+            let s = s.clone();
+            async move {
+                s.lock().unwrap().push(r.id);
+                Ok(())
+            }
+        });
+        let mut src = MockBounded {
+            events: vec![
+                Ok(Some(ins("users", "1", 10))),
+                Ok(Some(ins("users", "2", 20))),
+                Ok(None),
+                Ok(Some(ins("users", "3", 30))),
+            ]
+            .into(),
+            last_ack: AtomicU64::new(0),
+        };
+        router
+            .run_before_over(&mut src, Lsn::new(25))
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2]);
+        assert_eq!(src.last_ack.load(Ordering::Relaxed), 20);
+        assert_eq!(src.events.len(), 1, "nothing past the boundary is read");
+    }
+
+    /// Cancellation must not look like the boundary, so it is returned as an error.
+    #[tokio::test]
+    async fn run_before_returns_cancellation_as_an_error() {
+        let mut router = WalRouter::new();
+        let mut src = MockBounded {
+            events: vec![Err(ReplicationError::Cancelled("stop".into()))].into(),
+            last_ack: AtomicU64::new(0),
+        };
+        let err = router
+            .run_before_over(&mut src, Lsn::new(1))
+            .await
+            .unwrap_err();
+        assert!(err.is_cancelled(), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_aligned_dispatches_every_copied_row_as_an_insert() {
+        let seen = Arc::new(Mutex::new(Vec::<i64>::new()));
+        let s = seen.clone();
+        let mut router = WalRouter::new();
+        router.on_insert::<Row, _, _>("users", move |r| {
+            let s = s.clone();
+            async move {
+                s.lock().unwrap().push(r.id);
+                Ok(())
+            }
+        });
+        let mut copy = crate::AlignedSnapshot::mock(vec![Ok(()), Ok(())], Lsn::new(5));
+        router.run_aligned(&mut copy).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2]);
+        copy.finish().unwrap();
     }
 }
