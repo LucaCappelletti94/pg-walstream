@@ -220,14 +220,13 @@ impl TableCopy {
                             "snapshot cancelled".to_string(),
                         ));
                     }
-                    match remaining.pop() {
-                        Some(table) => {
-                            reader.copy_out_begin(&table.copy_sql)?;
-                            *decoder = TextRowDecoder::new();
-                            *current = Some(table);
-                        }
-                        None => return Ok(None),
-                    }
+                    // Popped only once the COPY has started, so a cancelled start cannot drop a table.
+                    let Some(next) = remaining.last() else {
+                        return Ok(None);
+                    };
+                    reader.copy_out_begin_async(&next.copy_sql).await?;
+                    *decoder = TextRowDecoder::new();
+                    *current = remaining.pop();
                 }
             }
         }

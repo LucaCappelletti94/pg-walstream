@@ -663,6 +663,67 @@ async fn slot_already_exists_yields_unavailable() {
     stream.start(None).await.expect("start must still work");
 }
 
+/// A `snapshot()` cancelled while `CREATE_REPLICATION_SLOT` waits must not leave
+/// the slot for the next attempt to mistake for a pre-existing subscription.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn snapshot_cancelled_during_slot_creation_leaves_no_slot() {
+    let (slot, table, publication) = (
+        "it_snap_cancel_create",
+        "snap_cancel_create",
+        "snap_cancel_create_pub",
+    );
+    let _guard = slot_guard(slot);
+    setup(table, publication, &["x"]);
+
+    // An open transaction holding an xid makes slot creation wait for it to end.
+    let mut blocker = regular_conn();
+    blocker.exec("BEGIN").expect("begin");
+    blocker
+        .exec(&format!("INSERT INTO {table} (name) VALUES ('held')"))
+        .expect("insert");
+
+    let stream = LogicalReplicationStream::new(
+        &replication_conn_string(),
+        snapshot_config(slot, publication),
+    )
+    .await
+    .expect("connect");
+    let cancelled = tokio::time::timeout(Duration::from_millis(500), stream.snapshot()).await;
+    assert!(
+        cancelled.is_err(),
+        "slot creation must still be waiting on the open transaction"
+    );
+    let mut probe = regular_conn();
+    let count = |probe: &mut PgReplicationConnection| {
+        probe_count(
+            &probe
+                .exec(&format!(
+                    "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{slot}'"
+                ))
+                .expect("count slots"),
+        )
+    };
+    assert_eq!(
+        count(&mut probe),
+        1,
+        "the server holds the half-created slot while it waits"
+    );
+    blocker.exec("COMMIT").expect("commit");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while count(&mut probe) != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the cancelled snapshot left slot {slot} behind"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Later checkpoints or walsender exits must not resurrect it.
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    assert_eq!(count(&mut probe), 0, "slot {slot} reappeared");
+}
+
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn abandon_returns_the_stream_and_start_succeeds() {

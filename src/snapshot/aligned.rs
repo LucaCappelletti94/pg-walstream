@@ -60,16 +60,16 @@ use tokio_util::sync::CancellationToken;
 /// also wait for transactions that start during the wait, so the caller must
 /// not hold one open. The reader's `REPEATABLE READ` transaction then pins the
 /// database's `xmin` until [`finish`](Self::finish) or drop, exactly as a
-/// [`Snapshot`](super::Snapshot) does. Each table's `COPY` start is a blocking
-/// round-trip, as in [`snapshot`](LogicalReplicationStream::snapshot).
+/// [`Snapshot`](super::Snapshot) does.
 ///
 /// # Cancellation
 ///
-/// Dropping the future that [`capture`](Self::capture) returns does not stop
-/// its setup. The side connection keeps its walsender until slot creation
-/// ends, so captures abandoned behind a long transaction can exhaust
-/// `max_wal_senders` and block the running stream's own reconnect.
-/// [`with_cancellation`](Self::with_cancellation) covers only the copy loop.
+/// Dropping the future that [`capture`](Self::capture) returns closes its
+/// connections, but a slot creation already sent keeps its walsender waiting
+/// on the server until that wait ends. Captures abandoned behind a long
+/// transaction can therefore exhaust `max_wal_senders` and block the running
+/// stream's own reconnect. [`with_cancellation`](Self::with_cancellation)
+/// covers only the copy loop.
 ///
 /// # Failure
 ///
@@ -92,34 +92,17 @@ impl AlignedSnapshot {
     /// shape the stream delivers. A table the publications do not carry inside
     /// the snapshot is a [`ReplicationError::Config`] naming it.
     ///
-    /// The setup runs on tokio's blocking pool, because creating the slot waits
-    /// for every open transaction and would otherwise stall the runtime that
-    /// drives the running stream. Dropping the returned future leaves it
-    /// running to completion.
+    /// None of the setup blocks the calling thread, so the slot creation, which
+    /// waits for every open transaction, does not stall the runtime that drives
+    /// the running stream.
     pub async fn capture(
         conninfo: &str,
         publications: &[&str],
         tables: &[(&str, &str)],
     ) -> Result<Self> {
         let publications = validate_request(publications, tables)?;
-        let conninfo = conninfo.to_string();
-        let requested: Vec<(String, String)> = tables
-            .iter()
-            .map(|(schema, table)| (schema.to_string(), table.to_string()))
-            .collect();
-        let setup = tokio::task::spawn_blocking(move || {
-            capture_blocking(&conninfo, &publications, &requested)
-        })
-        .await;
-        let (reader, tables, consistent_point) = match setup {
-            Ok(result) => result?,
-            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-            Err(e) => {
-                return Err(ReplicationError::cancelled(format!(
-                    "aligned snapshot setup did not finish: {e}"
-                )))
-            }
-        };
+        let (reader, tables, consistent_point) =
+            capture_tables(conninfo, &publications, tables).await?;
 
         tracing::info!(
             "Aligned snapshot ready: {} table(s) at {}",
@@ -219,41 +202,42 @@ impl LogicalReplicationStream {
 }
 
 /// Create the side slot, import its snapshot on a reader, and resolve the requested tables inside it.
-fn capture_blocking(
+async fn capture_tables(
     conninfo: &str,
     publications: &[String],
-    requested: &[(String, String)],
+    requested: &[(&str, &str)],
 ) -> Result<(PgReplicationConnection, Vec<SnapshotTable>, Lsn)> {
-    let mut side = PgReplicationConnection::connect(&plan::derive_side_conninfo(conninfo))?;
-    let created = side.create_replication_slot_with_options(
-        &side_slot_name(),
-        SlotType::Logical,
-        Some("pgoutput"),
-        &ReplicationSlotOptions {
-            temporary: true,
-            snapshot: Some("export".to_string()),
-            ..Default::default()
-        },
-    )?;
+    let mut side =
+        PgReplicationConnection::connect_async(&plan::derive_side_conninfo(conninfo)).await?;
+    let created = side
+        .create_replication_slot_with_options_async(
+            &side_slot_name(),
+            SlotType::Logical,
+            Some("pgoutput"),
+            &ReplicationSlotOptions {
+                temporary: true,
+                snapshot: Some("export".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
     let exported = created.get_value(0, 2);
     let (consistent_point, snapshot_name) =
         slot_creation_result(created.get_value(0, 1).as_deref(), exported.as_deref())?;
 
-    let mut reader = PgReplicationConnection::connect(&plan::derive_reader_conninfo(conninfo))?;
+    let mut reader =
+        PgReplicationConnection::connect_async(&plan::derive_reader_conninfo(conninfo)).await?;
     let published = resolve_tables(
         &mut reader,
         snapshot_name,
         side.server_version(),
         publications,
-    )?;
+    )
+    .await?;
     // The reader holds the snapshot now, and closing the side connection drops its temporary slot.
     drop(side);
 
-    let requested: Vec<(&str, &str)> = requested
-        .iter()
-        .map(|(schema, table)| (schema.as_str(), table.as_str()))
-        .collect();
-    let tables = select_tables(published, &requested, publications)?;
+    let tables = select_tables(published, requested, publications)?;
     Ok((reader, tables, consistent_point))
 }
 

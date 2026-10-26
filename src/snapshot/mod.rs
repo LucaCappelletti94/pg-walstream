@@ -297,27 +297,19 @@ impl LogicalReplicationStream {
     ///
     /// # Blocking
     ///
-    /// Setup opens the reader connection (a blocking connect; on the native
-    /// backend only the TCP connect is bounded by `connect_timeout` — TLS
-    /// negotiation and startup/auth are not, whereas libpq bounds the whole
-    /// attempt), then issues three short, blocking round-trips on it (`BEGIN`,
-    /// `SET TRANSACTION SNAPSHOT`, one catalog query), exactly as
-    /// [`ensure_replication_slot`](Self::ensure_replication_slot) and
-    /// [`start`](Self::start) already do on the replication connection.
+    /// None of the setup blocks the calling thread. Slot creation, the reader
+    /// connect, its three short round-trips (`BEGIN`, `SET TRANSACTION SNAPSHOT`,
+    /// one catalog query) and each per-table `COPY` start are awaited, so an
+    /// enclosing timeout or cancellation takes effect while they wait.
     ///
-    /// The per-table `COPY` is **not** part of setup. `copy_out_begin` is
-    /// blocking too, and the row loop issues it once per table as it reaches
-    /// that table, so those round-trips are spread through consumption rather
-    /// than paid up front; only the data loop (`copy_out_next`) is async and
-    /// cancellable. That is this crate's usual split — every control-plane
-    /// command is blocking — but it means that on a current-thread runtime each
-    /// `COPY` start occupies the runtime's only thread until the server answers,
-    /// with no timeout.
+    /// A cancelled setup does not leave its slot behind. A slot that was absent
+    /// before `CREATE_REPLICATION_SLOT` and whose creation was cancelled is
+    /// dropped from a background thread over a fresh connection, once the
+    /// cancelled connection's walsender lets go of it.
     ///
     /// No control-plane round-trip has a statement deadline on either backend,
-    /// and that includes the `DROP_REPLICATION_SLOT` this module's `Drop` impls
-    /// run to clean up after a failed snapshot — the case most likely to meet a
-    /// connection that has already gone away.
+    /// and the `DROP_REPLICATION_SLOT` this module's `Drop` impls run to clean up
+    /// after a failed snapshot is blocking, since `Drop` cannot await.
     ///
     /// The knob that bounds them is `tcp_user_timeout=<milliseconds>` in the
     /// connection string (Linux-family only; honoured by both backends).
@@ -344,42 +336,53 @@ impl LogicalReplicationStream {
         // as a runtime `Config` error, and the ordering rule had to be documented
         // on three separate setters. Setting it here needs no flag, no ordering
         // rule, and no error.
-        //
-        // A no-op when the slot already exists: `ensure_replication_slot`
-        // short-circuits on `slot_created`, which is the `Unavailable` path
-        // below.
         self.require_exported_snapshot();
-        self.ensure_replication_slot().await?;
+
+        let absent_before = !self.slot_is_present() && !self.slot_exists_on_server().await?;
+        let mut guard = SetupGuard {
+            stream: Some(self),
+            create_in_flight: absent_before,
+        };
+        // A no-op when the slot already exists, which is the `Unavailable` path below.
+        let created = guard.stream().ensure_replication_slot().await;
+        guard.create_in_flight = false;
+        created?;
 
         // A pre-existing slot exported no snapshot. Not an error by default: it is
         // the ordinary "resume an existing subscription" path.
         let (Some(snapshot_name), Some(consistent_point)) = (
-            self.exported_snapshot_name().map(|s| s.to_string()),
-            self.consistent_point(),
+            guard
+                .stream()
+                .exported_snapshot_name()
+                .map(|s| s.to_string()),
+            guard.stream().consistent_point(),
         ) else {
             tracing::info!("No exported snapshot available; the replication slot already existed");
-            return Ok(SnapshotOutcome::Unavailable(self));
+            return Ok(SnapshotOutcome::Unavailable(guard.release()));
         };
 
-        let publications = plan::split_publication_names(&self.config().publication_name);
-        let server_version = self.server_version();
+        let publications = plan::split_publication_names(&guard.stream().config().publication_name);
+        let server_version = guard.stream().server_version();
 
         // Everything past this point runs with a slot we just created. If any of
         // it fails we must drop that slot again: leaving it behind would make the
         // NEXT attempt find it present, export no snapshot, and hand the caller
         // `Unavailable` — which they would reasonably treat as "resuming an
         // existing subscription" and stream with no baseline at all. That is a
-        // silent, unbounded data gap produced by a transient setup failure.
-        let prepared = PgReplicationConnection::connect(reader_conninfo).and_then(|mut reader| {
+        // silent, unbounded data gap produced by a transient setup failure. The
+        // guard covers cancellation, this match covers errors.
+        let prepared = async {
+            let mut reader = PgReplicationConnection::connect_async(reader_conninfo).await?;
             let tables =
-                resolve_tables(&mut reader, &snapshot_name, server_version, &publications)?;
+                resolve_tables(&mut reader, &snapshot_name, server_version, &publications).await?;
             Ok((reader, tables))
-        });
+        }
+        .await;
 
         let (reader, tables) = match prepared {
             Ok(prepared) => prepared,
             Err(e) => {
-                self.discard_replication_slot();
+                guard.stream().discard_replication_slot_async().await;
                 return Err(e);
             }
         };
@@ -391,7 +394,7 @@ impl LogicalReplicationStream {
         );
 
         Ok(SnapshotOutcome::Available(Snapshot {
-            stream: Some(self),
+            stream: Some(guard.release()),
             reader: Some(reader),
             tables,
             consistent_point,
@@ -400,8 +403,66 @@ impl LogicalReplicationStream {
     }
 }
 
+/// Owns the stream while [`LogicalReplicationStream::snapshot`] sets up, so a cancelled setup cannot leave its new slot behind.
+struct SetupGuard {
+    stream: Option<LogicalReplicationStream>,
+    /// Raised while `CREATE_REPLICATION_SLOT` for a slot that was absent beforehand awaits its reply.
+    create_in_flight: bool,
+}
+
+impl SetupGuard {
+    fn stream(&mut self) -> &mut LogicalReplicationStream {
+        self.stream.as_mut().expect(SETUP_STREAM_TAKEN)
+    }
+
+    fn release(mut self) -> LogicalReplicationStream {
+        self.stream.take().expect(SETUP_STREAM_TAKEN)
+    }
+}
+
+const SETUP_STREAM_TAKEN: &str = "the setup guard holds the stream until it is released";
+
+impl Drop for SetupGuard {
+    fn drop(&mut self) {
+        let Some(mut stream) = self.stream.take() else {
+            return;
+        };
+        if !self.create_in_flight {
+            stream.discard_replication_slot();
+            return;
+        }
+        // The slot may exist with its reply unread, and the cancelled connection refuses further commands.
+        let conninfo = stream.conninfo().to_string();
+        let slot = stream.config().slot_name.clone();
+        drop(stream);
+        let cleanup = std::thread::Builder::new()
+            .name("pg-walstream-slot-cleanup".to_string())
+            .spawn(move || drop_abandoned_slot(&conninfo, &slot));
+        if let Err(e) = cleanup {
+            tracing::warn!("Could not start the cleanup of a cancelled snapshot slot: {e}");
+        }
+    }
+}
+
+/// Drop a slot whose creation was cancelled, waiting until the cancelled walsender releases it.
+fn drop_abandoned_slot(conninfo: &str, slot: &str) {
+    let dropped = PgReplicationConnection::connect(conninfo)
+        .and_then(|mut connection| connection.drop_replication_slot(slot, true));
+    match dropped {
+        Ok(()) => tracing::info!("Dropped replication slot {slot} after a cancelled snapshot"),
+        Err(e) if e.to_string().contains("does not exist") => {
+            tracing::debug!("The cancelled snapshot never created replication slot {slot}");
+        }
+        Err(e) => tracing::warn!(
+            "Could not drop replication slot {slot} after a cancelled snapshot: {e}. Drop it \
+             manually, or the next snapshot attempt will find it present and silently proceed \
+             without a baseline."
+        ),
+    }
+}
+
 /// Pin the reader to the exported snapshot and read the published table list.
-fn resolve_tables(
+async fn resolve_tables(
     reader: &mut PgReplicationConnection,
     snapshot_name: &str,
     server_version: i32,
@@ -409,16 +470,20 @@ fn resolve_tables(
 ) -> Result<Vec<SnapshotTable>> {
     // READ ONLY makes the intent explicit and lets the server skip assigning an
     // xid; REPEATABLE READ is required by SET TRANSACTION SNAPSHOT.
-    reader.exec("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")?;
-    reader.exec(&format!(
-        "SET TRANSACTION SNAPSHOT {}",
-        quote_literal(snapshot_name)?
-    ))?;
+    reader
+        .exec_async("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await?;
+    reader
+        .exec_async(&format!(
+            "SET TRANSACTION SNAPSHOT {}",
+            quote_literal(snapshot_name)?
+        ))
+        .await?;
 
     // Run inside the snapshot transaction so the catalog we read is the one the
     // COPYs will see, and a concurrent ALTER PUBLICATION cannot race us.
     let sql = plan::build_catalog_sql(server_version, publications)?;
-    let result = reader.exec(&sql)?;
+    let result = reader.exec_async(&sql).await?;
     let rows = catalog_rows_from_result(&result)?;
 
     let tables = plan::tables_from_catalog_rows(&rows)?;
@@ -918,6 +983,7 @@ mod tests {
             crate::sql_builder::PG15,
             &["p".to_string()],
         )
+        .await
         .unwrap_err();
         assert!(!matches!(err, ReplicationError::Config(_)), "{err:?}");
     }
