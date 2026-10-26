@@ -3362,12 +3362,66 @@ mod tests {
         assert!(debug.contains("Lsn"), "got: {debug}");
     }
 
-    /// Commit-carrying events report the commit position, never `end_lsn`, and nothing else reports one.
+    /// The answer `commit_lsn` owes each variant, with no wildcard arm, so a new variant must be classified here.
+    fn expected_commit_lsn(event: &EventType) -> Option<Lsn> {
+        match event {
+            EventType::Begin { final_lsn, .. } => Some(*final_lsn),
+            EventType::Commit { commit_lsn, .. }
+            | EventType::StreamCommit { commit_lsn, .. }
+            | EventType::CommitPrepared { commit_lsn, .. } => Some(*commit_lsn),
+            EventType::Insert { .. }
+            | EventType::Update { .. }
+            | EventType::Delete { .. }
+            | EventType::Truncate { .. }
+            | EventType::StreamStart { .. }
+            | EventType::StreamStop
+            | EventType::StreamAbort { .. }
+            | EventType::Relation { .. }
+            | EventType::Type { .. }
+            | EventType::Origin { .. }
+            | EventType::Message { .. }
+            | EventType::BeginPrepare { .. }
+            | EventType::Prepare { .. }
+            | EventType::RollbackPrepared { .. }
+            | EventType::StreamPrepare { .. } => None,
+        }
+    }
+
+    /// Commit-carrying events report the commit position, never `end_lsn`, and no other variant reports one.
     #[test]
     fn commit_lsn_is_the_commit_position_of_commit_carrying_events_only() {
         let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
         let (commit, end) = (Lsn::new(0x100), Lsn::new(0x200));
-        let with_commit = [
+        let (schema, table, gid) = (Arc::from("public"), Arc::from("t"), Arc::from("g"));
+        let every_variant = [
+            EventType::Insert {
+                schema: Arc::clone(&schema),
+                table: Arc::clone(&table),
+                relation_oid: 1,
+                data: RowData::new(),
+            },
+            EventType::Update {
+                schema: Arc::clone(&schema),
+                table: Arc::clone(&table),
+                relation_oid: 1,
+                old_data: None,
+                new_data: RowData::new(),
+                replica_identity: ReplicaIdentity::Default,
+                key_columns: Vec::new(),
+            },
+            EventType::Delete {
+                schema: Arc::clone(&schema),
+                table: Arc::clone(&table),
+                relation_oid: 1,
+                old_data: RowData::new(),
+                replica_identity: ReplicaIdentity::Default,
+                key_columns: Vec::new(),
+            },
+            EventType::Truncate {
+                tables: vec![Arc::from("public.t")],
+                cascade: false,
+                restart_identity: false,
+            },
             EventType::Begin {
                 transaction_id: 7,
                 final_lsn: commit,
@@ -3378,56 +3432,51 @@ mod tests {
                 commit_lsn: commit,
                 end_lsn: end,
             },
+            EventType::StreamStart {
+                transaction_id: 7,
+                first_segment: true,
+            },
+            EventType::StreamStop,
             EventType::StreamCommit {
                 transaction_id: 7,
                 commit_lsn: commit,
                 end_lsn: end,
                 commit_timestamp: ts,
             },
-            EventType::CommitPrepared {
-                flags: 0,
+            EventType::StreamAbort {
                 transaction_id: 7,
-                commit_lsn: commit,
-                end_lsn: end,
-                commit_timestamp: ts,
-                gid: Arc::from("g"),
+                subtransaction_xid: 7,
+                abort_lsn: Some(commit),
+                abort_timestamp: None,
             },
-        ];
-        for event in &with_commit {
-            assert_eq!(event.commit_lsn(), Some(commit), "{event:?}");
-        }
-
-        let without_commit = [
-            EventType::Insert {
-                schema: Arc::from("public"),
-                table: Arc::from("t"),
-                relation_oid: 1,
-                data: RowData::new(),
+            EventType::Relation {
+                relation_id: 1,
+                namespace: Arc::clone(&schema),
+                relation_name: Arc::clone(&table),
+                replica_identity: ReplicaIdentity::Default,
+                columns: Vec::new(),
             },
-            EventType::Truncate {
-                tables: vec![Arc::from("public.t")],
-                cascade: false,
-                restart_identity: false,
+            EventType::Type {
+                type_id: 23,
+                namespace: Arc::clone(&schema),
+                type_name: Arc::from("int4"),
             },
-            EventType::StreamStart {
-                transaction_id: 7,
-                first_segment: true,
+            EventType::Origin {
+                origin_lsn: commit,
+                origin_name: Arc::from("o"),
             },
-            EventType::StreamStop,
+            EventType::Message {
+                flags: 1,
+                message_lsn: commit,
+                prefix: Arc::from("p"),
+                content: Bytes::new(),
+            },
             EventType::BeginPrepare {
                 transaction_id: 7,
                 prepare_lsn: commit,
                 end_lsn: end,
                 prepare_timestamp: ts,
-                gid: Arc::from("g"),
-            },
-            EventType::StreamPrepare {
-                flags: 0,
-                transaction_id: 7,
-                prepare_lsn: commit,
-                end_lsn: end,
-                prepare_timestamp: ts,
-                gid: Arc::from("g"),
+                gid: Arc::clone(&gid),
             },
             EventType::Prepare {
                 flags: 0,
@@ -3435,7 +3484,15 @@ mod tests {
                 prepare_lsn: commit,
                 end_lsn: end,
                 prepare_timestamp: ts,
-                gid: Arc::from("g"),
+                gid: Arc::clone(&gid),
+            },
+            EventType::CommitPrepared {
+                flags: 0,
+                transaction_id: 7,
+                commit_lsn: commit,
+                end_lsn: end,
+                commit_timestamp: ts,
+                gid: Arc::clone(&gid),
             },
             EventType::RollbackPrepared {
                 flags: 0,
@@ -3444,18 +3501,33 @@ mod tests {
                 rollback_end_lsn: end,
                 prepare_timestamp: ts,
                 rollback_timestamp: ts,
-                gid: Arc::from("g"),
+                gid: Arc::clone(&gid),
             },
-            EventType::StreamAbort {
+            EventType::StreamPrepare {
+                flags: 0,
                 transaction_id: 7,
-                subtransaction_xid: 7,
-                abort_lsn: Some(commit),
-                abort_timestamp: None,
+                prepare_lsn: commit,
+                end_lsn: end,
+                prepare_timestamp: ts,
+                gid,
             },
         ];
-        for event in &without_commit {
-            assert_eq!(event.commit_lsn(), None, "{event:?}");
+        let variants: std::collections::HashSet<_> =
+            every_variant.iter().map(core::mem::discriminant).collect();
+        assert_eq!(
+            variants.len(),
+            every_variant.len(),
+            "a variant is listed twice"
+        );
+
+        for event in &every_variant {
+            assert_eq!(event.commit_lsn(), expected_commit_lsn(event), "{event:?}");
         }
+        let reported: Vec<Lsn> = every_variant
+            .iter()
+            .filter_map(EventType::commit_lsn)
+            .collect();
+        assert_eq!(reported, [commit; 4]);
     }
 
     #[test]

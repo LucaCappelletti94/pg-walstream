@@ -975,4 +975,37 @@ mod tests {
             );
         }
     }
+
+    /// The side connection's string is the caller's with `replication=database` appended, so the last occurrence wins on both backends.
+    #[test]
+    fn side_conninfo_appends_replication_database_in_every_form() {
+        for (base, derived) in [
+            (
+                "postgresql://u@h/db",
+                "postgresql://u@h/db?replication=database",
+            ),
+            (
+                "postgres://u@h/db?replication=false&sslmode=require",
+                "postgres://u@h/db?replication=false&sslmode=require&replication=database",
+            ),
+            (
+                "postgresql://u@h/db?",
+                "postgresql://u@h/db?replication=database",
+            ),
+            (
+                "host=h dbname=db replication=false",
+                "host=h dbname=db replication=false replication=database",
+            ),
+            (
+                "  postgresql://u@h/db",
+                "  postgresql://u@h/db?replication=database",
+            ),
+            (
+                "  host=h dbname=db",
+                "  host=h dbname=db replication=database",
+            ),
+        ] {
+            assert_eq!(derive_side_conninfo(base), derived, "{base}");
+        }
+    }
 }

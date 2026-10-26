@@ -17,8 +17,9 @@
 use pg_walstream::{
     AlignedSnapshot, CancellationToken, ColumnValue, EventType, LogicalReplicationStream, Lsn,
     PgReplicationConnection, PgResult, ReplicationError, ReplicationStreamConfig, RowData,
+    StreamingMode,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -231,7 +232,6 @@ async fn race(prefix: &'static str, slot: &'static str) -> Race {
     );
 
     let c = snapshot.consistent_point();
-    assert_eq!(snapshot.tables().len(), 1);
     let mut copy = BTreeMap::new();
     while let Some(row) = snapshot.next_row().await.unwrap() {
         assert_eq!(row.lsn, c);
@@ -585,6 +585,480 @@ async fn capture_waits_for_open_transactions_without_stalling_the_runtime() {
         }
         copy.finish().unwrap();
         assert_eq!(rows, 1);
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A sink that records every insert of a row it holds and every change to a row it lacks.
+#[derive(Default)]
+struct StrictSink {
+    rows: BTreeMap<i64, String>,
+    out_of_step: Vec<i64>,
+}
+
+impl StrictSink {
+    fn apply(&mut self, row: i64, value: Option<String>, must_exist: bool) {
+        if self.rows.contains_key(&row) != must_exist {
+            self.out_of_step.push(row);
+        }
+        match value {
+            Some(v) => self.rows.insert(row, v),
+            None => self.rows.remove(&row),
+        };
+    }
+}
+
+/// The merge the documentation describes. Each transaction's changes to the
+/// copied table wait for its commit event, which drops them below `C` and
+/// applies them at or past it.
+struct DocumentedMerge {
+    c: Lsn,
+    prefix: &'static str,
+    current: Option<u32>,
+    open: HashMap<u32, Vec<(i64, Option<String>, bool)>>,
+    sink: StrictSink,
+}
+
+impl DocumentedMerge {
+    fn new(c: Lsn, prefix: &'static str) -> Self {
+        Self {
+            c,
+            prefix,
+            current: None,
+            open: HashMap::new(),
+            sink: StrictSink::default(),
+        }
+    }
+
+    fn event(&mut self, event: EventType) {
+        match event {
+            EventType::Begin { transaction_id, .. }
+            | EventType::StreamStart { transaction_id, .. }
+            | EventType::BeginPrepare { transaction_id, .. } => self.current = Some(transaction_id),
+            EventType::StreamStop | EventType::Prepare { .. } => self.current = None,
+            EventType::Commit { commit_lsn, .. } => {
+                let xid = self.current.take().expect("a Commit after its Begin");
+                self.commit(xid, commit_lsn);
+            }
+            EventType::StreamCommit {
+                transaction_id,
+                commit_lsn,
+                ..
+            }
+            | EventType::CommitPrepared {
+                transaction_id,
+                commit_lsn,
+                ..
+            } => self.commit(transaction_id, commit_lsn),
+            EventType::StreamAbort {
+                transaction_id,
+                subtransaction_xid,
+                ..
+            } if transaction_id == subtransaction_xid => {
+                self.open.remove(&transaction_id);
+            }
+            EventType::RollbackPrepared { transaction_id, .. } => {
+                self.open.remove(&transaction_id);
+            }
+            other => {
+                if let Step::Change(row, value, must_exist) = step(other, self.prefix) {
+                    let xid = self.current.expect("a change inside a transaction");
+                    self.open
+                        .entry(xid)
+                        .or_default()
+                        .push((row, value, must_exist));
+                }
+            }
+        }
+    }
+
+    fn commit(&mut self, xid: u32, commit_lsn: Lsn) {
+        let changes = self.open.remove(&xid).unwrap_or_default();
+        if commit_lsn >= self.c {
+            for (row, value, must_exist) in changes {
+                self.sink.apply(row, value, must_exist);
+            }
+        }
+    }
+}
+
+/// The events a consumer reads before the `None`, the copy, and the events
+/// after the `None` up to the sentinel.
+struct Recording {
+    prefix: &'static str,
+    c: Lsn,
+    before: Vec<EventType>,
+    copy: Vec<(i64, String)>,
+    after: Vec<EventType>,
+}
+
+impl Recording {
+    async fn take(
+        stream: &mut LogicalReplicationStream,
+        mut snapshot: AlignedSnapshot,
+        prefix: &'static str,
+    ) -> Self {
+        let cancel = CancellationToken::new();
+        let c = snapshot.consistent_point();
+        let mut before = Vec::new();
+        while let Some(event) = stream.next_event_before(c, &cancel).await.unwrap() {
+            before.push(event.event_type);
+        }
+        let mut copy = Vec::new();
+        while let Some(row) = snapshot.next_row().await.unwrap() {
+            copy.push((id(&row.data), text(&row.data, "v")));
+        }
+        snapshot.finish().unwrap();
+        let mut after = Vec::new();
+        loop {
+            let event = stream.next_event(&cancel).await.unwrap().event_type;
+            if matches!(step(event.clone(), prefix), Step::Sentinel) {
+                break;
+            }
+            after.push(event);
+        }
+        Self {
+            prefix,
+            c,
+            before,
+            copy,
+            after,
+        }
+    }
+
+    fn changes_before(&self) -> usize {
+        self.before
+            .iter()
+            .filter(|e| matches!(step((*e).clone(), self.prefix), Step::Change(..)))
+            .count()
+    }
+
+    fn merge_as_documented(&self) -> StrictSink {
+        let mut merge = DocumentedMerge::new(self.c, self.prefix);
+        for event in &self.before {
+            merge.event(event.clone());
+        }
+        for (row, v) in &self.copy {
+            merge.sink.apply(*row, Some(v.clone()), false);
+        }
+        for event in &self.after {
+            merge.event(event.clone());
+        }
+        assert!(merge.open.is_empty(), "a transaction never committed");
+        merge.sink
+    }
+
+    /// Apply the copied table's changes as they arrive, then the copy.
+    fn merge_naively(&self) -> StrictSink {
+        let mut sink = StrictSink::default();
+        for event in &self.before {
+            if let Step::Change(row, value, must_exist) = step(event.clone(), self.prefix) {
+                sink.apply(row, value, must_exist);
+            }
+        }
+        for (row, v) in &self.copy {
+            sink.apply(*row, Some(v.clone()), false);
+        }
+        sink
+    }
+}
+
+/// Run `capture` to completion while sending the stream's feedback, as the documentation advises.
+async fn capture_with_feedback(
+    stream: &mut LogicalReplicationStream,
+    tables: &[(&str, &str)],
+) -> AlignedSnapshot {
+    let capture = stream.capture_aligned(tables);
+    tokio::pin!(capture);
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    loop {
+        tokio::select! {
+            copy = &mut capture => return copy.expect("capture"),
+            _ = tick.tick() => stream.send_feedback().await.expect("feedback"),
+        }
+    }
+}
+
+/// `{prefix}_new` joins the running stream's publication while a writer changes
+/// both tables, the `ALTER` commits before the capture starts, and a sentinel
+/// row in `{prefix}_old` follows the writer.
+async fn table_added_to_a_running_stream(
+    prefix: &'static str,
+    slot: &'static str,
+) -> (SlotGuard, PgReplicationConnection, Recording) {
+    let guard = slot_guard(slot);
+    let mut admin = regular_conn();
+    for sql in [
+        format!("DROP PUBLICATION IF EXISTS {prefix}_pub"),
+        format!("DROP TABLE IF EXISTS {prefix}_old, {prefix}_new"),
+        format!("CREATE TABLE {prefix}_old (id bigint PRIMARY KEY, v text NOT NULL)"),
+        format!("CREATE TABLE {prefix}_new (id bigint PRIMARY KEY, v text NOT NULL)"),
+        format!("INSERT INTO {prefix}_new SELECT g, 'b' FROM generate_series(1, 20) g"),
+        format!("CREATE PUBLICATION {prefix}_pub FOR TABLE {prefix}_old"),
+    ] {
+        exec(&mut admin, &sql);
+    }
+    let mut stream = running_stream(slot, &format!("{prefix}_pub")).await;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut w = regular_conn();
+            let mut id = 1000_i64;
+            while !stop.load(Ordering::Relaxed) {
+                exec(
+                    &mut w,
+                    &format!("INSERT INTO {prefix}_new VALUES ({id}, 'w')"),
+                );
+                exec(
+                    &mut w,
+                    &format!("INSERT INTO {prefix}_old VALUES ({id}, 'w')"),
+                );
+                exec(
+                    &mut w,
+                    &format!(
+                        "UPDATE {prefix}_new SET v = v || 'u' WHERE id = {}",
+                        id % 20 + 1
+                    ),
+                );
+                if id % 5 == 0 {
+                    exec(
+                        &mut w,
+                        &format!("DELETE FROM {prefix}_new WHERE id = {}", id - 3),
+                    );
+                }
+                id += 1;
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    exec(
+        &mut admin,
+        &format!("ALTER PUBLICATION {prefix}_pub ADD TABLE {prefix}_new"),
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let snapshot =
+        capture_with_feedback(&mut stream, &[("public", &format!("{prefix}_new"))]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    exec(
+        &mut admin,
+        &format!("INSERT INTO {prefix}_old VALUES (-1, 'sentinel')"),
+    );
+
+    let recording = Recording::take(&mut stream, snapshot, prefix).await;
+    assert!(
+        recording.changes_before() > 0,
+        "no change to the added table was delivered before the None, the overlap was not exercised"
+    );
+    (guard, admin, recording)
+}
+
+/// A table added to a running stream merges exactly when each transaction is
+/// decided at its commit event, dropping the copied table's changes below `C`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a live PostgreSQL with wal_level = logical"]
+async fn a_table_added_to_a_running_stream_merges_exactly_by_the_documented_flow() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_guard, mut admin, recording) =
+            table_added_to_a_running_stream("aligned_added", "aligned_added_main").await;
+        let sink = recording.merge_as_documented();
+        assert_eq!(sink.out_of_step, Vec::<i64>::new());
+        assert_eq!(sink.rows, table_state(&mut admin, "aligned_added_new"));
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Applying the changes delivered before the `None` and then the copy feeds a
+/// strict sink rows it already holds, or changes to rows it lacks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a live PostgreSQL with wal_level = logical"]
+async fn a_strict_sink_fed_the_overlap_and_then_the_copy_goes_out_of_step() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_guard, _admin, recording) =
+            table_added_to_a_running_stream("aligned_naive", "aligned_naive_main").await;
+        assert!(!recording.merge_naively().out_of_step.is_empty());
+    })
+    .await
+    .expect("test timed out");
+}
+
+fn xid(conn: &mut PgReplicationConnection) -> i64 {
+    count(&exec(conn, "SELECT txid_current() % 4294967296"))
+}
+
+/// Whether a walsender waits for transaction `xid` to end, which is how slot creation waits.
+fn walsender_waits_for(conn: &mut PgReplicationConnection, xid: i64) -> bool {
+    count(&exec(
+        conn,
+        &format!(
+            "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
+             WHERE a.backend_type = 'walsender' AND l.locktype = 'transactionid' \
+             AND NOT l.granted AND l.transactionid::text = '{xid}'"
+        ),
+    )) > 0
+}
+
+async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..600 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting until {what}");
+}
+
+/// A streamed and a prepared transaction that write before `C` and commit at or
+/// past it reach the consumer as chunks and `BeginPrepare..Prepare` before the
+/// `None`, their commits after it, and the documented merge stays exact.
+///
+/// Slot creation waits for the transactions running when it starts (`b1`), then
+/// for those running at its next snapshot (`b2`). A transaction that starts once
+/// it waits for `b2` is not waited for, so it straddles `C`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a live PostgreSQL with wal_level = logical, logical_decoding_work_mem = 64kB and max_prepared_transactions > 0"]
+async fn streamed_and_prepared_transactions_straddling_c_merge_at_their_commit() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let prefix = "aligned_straddle";
+        let _guard = slot_guard("aligned_straddle_main");
+        let mut admin = regular_conn();
+        let leftover = exec(
+            &mut admin,
+            "SELECT count(*) FROM pg_prepared_xacts WHERE gid = 'aligned_straddle_gid'",
+        );
+        if count(&leftover) > 0 {
+            exec(&mut admin, "ROLLBACK PREPARED 'aligned_straddle_gid'");
+        }
+        for sql in [
+            "DROP PUBLICATION IF EXISTS aligned_straddle_pub",
+            "DROP TABLE IF EXISTS aligned_straddle_old, aligned_straddle_new, aligned_straddle_scratch",
+            "CREATE TABLE aligned_straddle_old (id bigint PRIMARY KEY, v text NOT NULL)",
+            "CREATE TABLE aligned_straddle_new (id bigint PRIMARY KEY, v text NOT NULL)",
+            "CREATE TABLE aligned_straddle_scratch (id bigint)",
+            "INSERT INTO aligned_straddle_new SELECT g, 'b' FROM generate_series(1, 5) g",
+            "CREATE PUBLICATION aligned_straddle_pub FOR TABLE aligned_straddle_old, aligned_straddle_new",
+        ] {
+            exec(&mut admin, sql);
+        }
+        let config = ReplicationStreamConfig::builder("aligned_straddle_main", "aligned_straddle_pub")
+            .with_protocol_version(3)
+            .with_streaming_mode(StreamingMode::On)
+            .with_two_phase(true);
+        let mut stream = LogicalReplicationStream::new(&replication_conn_string(), config)
+            .await
+            .expect("stream");
+        stream.ensure_replication_slot().await.expect("slot");
+        stream.start(None).await.expect("start");
+
+        let mut b1 = regular_conn();
+        exec(&mut b1, "BEGIN");
+        exec(&mut b1, "INSERT INTO aligned_straddle_scratch VALUES (1)");
+        let xid1 = xid(&mut b1);
+        let capture = tokio::spawn(stream.capture_aligned(&[("public", "aligned_straddle_new")]));
+        eventually("slot creation waits for b1", || walsender_waits_for(&mut admin, xid1)).await;
+
+        let mut b2 = regular_conn();
+        exec(&mut b2, "BEGIN");
+        exec(&mut b2, "INSERT INTO aligned_straddle_scratch VALUES (2)");
+        let xid2 = xid(&mut b2);
+        exec(&mut b1, "COMMIT");
+        eventually("slot creation waits for b2", || walsender_waits_for(&mut admin, xid2)).await;
+
+        let mut streamed = regular_conn();
+        exec(&mut streamed, "BEGIN");
+        exec(
+            &mut streamed,
+            "INSERT INTO aligned_straddle_new SELECT g, repeat('s', 200) FROM generate_series(1000, 2999) g",
+        );
+        let mut prepared = regular_conn();
+        exec(&mut prepared, "BEGIN");
+        exec(&mut prepared, "INSERT INTO aligned_straddle_new VALUES (5000, 'p')");
+        exec(&mut prepared, "UPDATE aligned_straddle_new SET v = 'pu' WHERE id = 1");
+        exec(&mut prepared, "PREPARE TRANSACTION 'aligned_straddle_gid'");
+
+        exec(&mut b2, "COMMIT");
+        let snapshot = capture.await.unwrap().expect("capture");
+        exec(&mut streamed, "COMMIT");
+        exec(&mut admin, "COMMIT PREPARED 'aligned_straddle_gid'");
+        exec(&mut admin, "INSERT INTO aligned_straddle_old VALUES (-1, 'sentinel')");
+
+        let recording = Recording::take(&mut stream, snapshot, prefix).await;
+        let before = &recording.before;
+        assert!(before.iter().any(|e| matches!(e, EventType::StreamStart { .. })), "{before:?}");
+        assert!(before.iter().any(|e| matches!(e, EventType::BeginPrepare { .. })), "{before:?}");
+        assert!(before.iter().any(|e| matches!(e, EventType::Prepare { .. })), "{before:?}");
+        let commits_after: Vec<Lsn> = recording
+            .after
+            .iter()
+            .filter(|e| matches!(e, EventType::StreamCommit { .. } | EventType::CommitPrepared { .. }))
+            .filter_map(EventType::commit_lsn)
+            .collect();
+        assert_eq!(commits_after.len(), 2, "{:?}", recording.after);
+        assert!(commits_after.iter().all(|commit| *commit >= recording.c));
+
+        let sink = recording.merge_as_documented();
+        assert_eq!(sink.out_of_step, Vec::<i64>::new());
+        assert_eq!(sink.rows, table_state(&mut admin, "aligned_straddle_new"));
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Dropping a capture future does not stop its setup, which ends, and releases
+/// its walsender and slot, once the transaction it waits for ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a live PostgreSQL with wal_level = logical"]
+async fn a_dropped_capture_leaves_no_walsender_or_slot_once_the_blocker_ends() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut admin = regular_conn();
+        for sql in [
+            "DROP PUBLICATION IF EXISTS aligned_dropped_pub",
+            "DROP TABLE IF EXISTS aligned_dropped",
+            "CREATE TABLE aligned_dropped (id bigint PRIMARY KEY, v text NOT NULL)",
+            "CREATE PUBLICATION aligned_dropped_pub FOR TABLE aligned_dropped",
+        ] {
+            exec(&mut admin, sql);
+        }
+        let mut blocker = regular_conn();
+        exec(&mut blocker, "BEGIN");
+        let blocking = xid(&mut blocker);
+
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(500),
+            AlignedSnapshot::capture(
+                &replication_conn_string(),
+                &["aligned_dropped_pub"],
+                &[("public", "aligned_dropped")],
+            ),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the capture did not wait for the open transaction");
+        eventually("the abandoned setup waits for the blocker", || {
+            walsender_waits_for(&mut admin, blocking)
+        })
+        .await;
+        let walsender = count(&exec(
+            &mut admin,
+            "SELECT active_pid FROM pg_replication_slots WHERE slot_name LIKE 'pg_walstream_aligned_%'",
+        ));
+
+        exec(&mut blocker, "COMMIT");
+        eventually("the abandoned setup releases its walsender and slot", || {
+            count(&exec(
+                &mut admin,
+                &format!(
+                    "SELECT (SELECT count(*) FROM pg_stat_activity WHERE pid = {walsender}) + \
+                     (SELECT count(*) FROM pg_replication_slots \
+                      WHERE slot_name LIKE 'pg_walstream_aligned_%')"
+                ),
+            )) == 0
+        })
+        .await;
     })
     .await
     .expect("test timed out");

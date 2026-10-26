@@ -85,7 +85,7 @@ impl SnapshotEvents {
 /// [`WalRouter`](crate::router::WalRouter) keyed on a table routes snapshot and
 /// live rows to the same handler.
 #[inline]
-pub(super) fn row_to_insert(row: SnapshotRow) -> ChangeEvent {
+fn row_to_insert(row: SnapshotRow) -> ChangeEvent {
     ChangeEvent::insert(
         Arc::clone(&row.relation.namespace),
         Arc::clone(&row.relation.relation_name),

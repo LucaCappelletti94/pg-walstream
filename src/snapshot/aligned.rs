@@ -19,22 +19,55 @@ use tokio_util::sync::CancellationToken;
 /// The copy contains every transaction whose commit record lies below `C` and
 /// none at or past it, which is what
 /// [`EXPORT_SNAPSHOT`](https://www.postgresql.org/docs/current/logicaldecoding-explanation.html#LOGICALDECODING-EXPLANATION-EXPORTED-SNAPSHOTS)
-/// guarantees. A consumer applies the running stream's transactions whose
-/// [`commit_lsn`](crate::EventType::commit_lsn) is below `C` first, then these
-/// rows, then every transaction from the first one committed at or past `C`.
-/// Streamed chunks and `PREPARE` carry no commit position, so a transaction is
-/// applied at its commit event.
+/// guarantees.
+///
+/// # Merging with the running stream
+///
+/// Commit the `ALTER PUBLICATION ... ADD TABLE` before [`capture`](Self::capture)
+/// starts. A table added while the capture waits can lose a row written before
+/// the `ALTER` committed, which then reaches neither the copy nor the stream.
+///
+/// The copy already holds every change to the copied tables that the stream
+/// delivers in a transaction committed below `C`. Buffer each transaction until
+/// its commit event and decide there by its
+/// [`commit_lsn`](crate::EventType::commit_lsn). Below `C`, apply it without the
+/// copied tables' rows. At or past `C`, apply it in full, after the copy. A
+/// transaction that ends in `RollbackPrepared` or in a `StreamAbort` of the
+/// whole transaction is dropped.
+///
+/// [`next_event_before`](LogicalReplicationStream::next_event_before) returns
+/// `None` once every commit below `C` has been delivered, which is where the
+/// copy loads. Streamed chunks, `BeginPrepare` through `Prepare`, and
+/// `StreamPrepare` carry no commit position, so they can arrive before that
+/// `None` for a transaction that commits at or past `C`.
+///
+/// # Keeping the stream alive
+///
+/// The walsender drops a stream that sends no status update for
+/// `wal_sender_timeout`. While the capture waits and while the copy loads, call
+/// [`send_feedback`](LogicalReplicationStream::send_feedback) more often than
+/// that, for example once a second. The future that
+/// [`capture_aligned`](LogicalReplicationStream::capture_aligned) returns
+/// borrows nothing from the stream, so the two can run side by side.
 ///
 /// # Cost
 ///
 /// [`capture`](Self::capture) opens a second replication connection and a
 /// temporary slot that both close once the reader has imported the snapshot.
-/// Creating the slot waits for every transaction open at that moment to end,
-/// so the caller must not hold one open. The reader's `REPEATABLE READ`
-/// transaction then pins the database's `xmin` until [`finish`](Self::finish)
-/// or drop, exactly as a [`Snapshot`](super::Snapshot) does. Each table's
-/// `COPY` start is a blocking round-trip, as in
-/// [`snapshot`](LogicalReplicationStream::snapshot).
+/// Creating the slot waits for the transactions open when it starts, and can
+/// also wait for transactions that start during the wait, so the caller must
+/// not hold one open. The reader's `REPEATABLE READ` transaction then pins the
+/// database's `xmin` until [`finish`](Self::finish) or drop, exactly as a
+/// [`Snapshot`](super::Snapshot) does. Each table's `COPY` start is a blocking
+/// round-trip, as in [`snapshot`](LogicalReplicationStream::snapshot).
+///
+/// # Cancellation
+///
+/// Dropping the future that [`capture`](Self::capture) returns does not stop
+/// its setup. The side connection keeps its walsender until slot creation
+/// ends, so captures abandoned behind a long transaction can exhaust
+/// `max_wal_senders` and block the running stream's own reconnect.
+/// [`with_cancellation`](Self::with_cancellation) covers only the copy loop.
 ///
 /// # Failure
 ///
@@ -43,7 +76,6 @@ use tokio_util::sync::CancellationToken;
 #[must_use = "the copy holds a snapshot transaction open until finish() or drop"]
 pub struct AlignedSnapshot {
     copy: TableCopy,
-    tables: Vec<SnapshotTable>,
     consistent_point: Lsn,
 }
 
@@ -60,7 +92,8 @@ impl AlignedSnapshot {
     ///
     /// The setup runs on tokio's blocking pool, because creating the slot waits
     /// for every open transaction and would otherwise stall the runtime that
-    /// drives the running stream.
+    /// drives the running stream. Dropping the returned future leaves it
+    /// running to completion.
     pub async fn capture(
         conninfo: &str,
         publications: &[&str],
@@ -92,13 +125,7 @@ impl AlignedSnapshot {
             consistent_point
         );
         Ok(Self {
-            copy: TableCopy::new(
-                reader,
-                tables.clone(),
-                consistent_point,
-                CancellationToken::new(),
-            ),
-            tables,
+            copy: TableCopy::new(reader, tables, consistent_point, CancellationToken::new()),
             consistent_point,
         })
     }
@@ -109,13 +136,7 @@ impl AlignedSnapshot {
         self.consistent_point
     }
 
-    /// The tables to be copied, in the requested order.
-    #[inline]
-    pub fn tables(&self) -> &[SnapshotTable] {
-        &self.tables
-    }
-
-    /// Bind a cancellation token to the copy loop.
+    /// Bind a cancellation token to the copy loop, which is all it stops.
     #[inline]
     pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
         self.copy.set_cancellation(token);
@@ -125,15 +146,6 @@ impl AlignedSnapshot {
     /// The next row, or `Ok(None)` once every table has been copied.
     pub async fn next_row(&mut self) -> Result<Option<SnapshotRow>> {
         self.copy.next_row().await
-    }
-
-    /// The next row as a synthetic `Insert` event, so one set of handlers serves the copy and the stream.
-    pub async fn next_event(&mut self) -> Result<Option<crate::types::ChangeEvent>> {
-        Ok(self
-            .copy
-            .next_row()
-            .await?
-            .map(super::events::row_to_insert))
     }
 
     /// Close the snapshot transaction after a fully consumed copy.
@@ -155,10 +167,9 @@ impl AlignedSnapshot {
     }
 
     #[cfg(test)]
-    pub(crate) fn mock(outcomes: Vec<Result<()>>, consistent_point: Lsn) -> Self {
+    fn mock(outcomes: Vec<Result<()>>, consistent_point: Lsn) -> Self {
         Self {
             copy: TableCopy::mock(outcomes, consistent_point),
-            tables: Vec::new(),
             consistent_point,
         }
     }
@@ -173,15 +184,35 @@ impl Drop for AlignedSnapshot {
 impl LogicalReplicationStream {
     /// [`AlignedSnapshot::capture`] with this stream's connection string and
     /// publications, leaving this stream's own connection untouched.
-    pub async fn capture_aligned(&self, tables: &[(&str, &str)]) -> Result<AlignedSnapshot> {
-        if self.config().slot_type != SlotType::Logical {
-            return Err(ReplicationError::config(
-                "an aligned snapshot requires a logical replication stream",
-            ));
-        }
+    ///
+    /// The returned future borrows nothing from the stream, so it can be
+    /// spawned, or raced against the
+    /// [`send_feedback`](Self::send_feedback) ticker that keeps the stream alive
+    /// while the capture waits.
+    pub fn capture_aligned(
+        &self,
+        tables: &[(&str, &str)],
+    ) -> impl core::future::Future<Output = Result<AlignedSnapshot>> + Send + 'static {
+        let logical = self.config().slot_type == SlotType::Logical;
+        let conninfo = self.conninfo().to_string();
         let publications = plan::split_publication_names(&self.config().publication_name);
-        let publications: Vec<&str> = publications.iter().map(String::as_str).collect();
-        AlignedSnapshot::capture(self.conninfo(), &publications, tables).await
+        let tables: Vec<(String, String)> = tables
+            .iter()
+            .map(|(schema, table)| (schema.to_string(), table.to_string()))
+            .collect();
+        async move {
+            if !logical {
+                return Err(ReplicationError::config(
+                    "an aligned snapshot requires a logical replication stream",
+                ));
+            }
+            let publications: Vec<&str> = publications.iter().map(String::as_str).collect();
+            let tables: Vec<(&str, &str)> = tables
+                .iter()
+                .map(|(schema, table)| (schema.as_str(), table.as_str()))
+                .collect();
+            AlignedSnapshot::capture(&conninfo, &publications, &tables).await
+        }
     }
 }
 
@@ -441,20 +472,17 @@ mod tests {
     /// A bound token stops the copy before the next table's `COPY` starts, and the handle cannot then pass for complete.
     #[tokio::test]
     async fn a_cancelled_copy_stops_before_the_next_table() {
-        let tables = published(&[("public", "a")]);
         let token = CancellationToken::new();
         let mut snapshot = AlignedSnapshot {
             copy: TableCopy::new(
                 PgReplicationConnection::null_for_testing(),
-                tables.clone(),
+                published(&[("public", "a")]),
                 Lsn::new(1),
                 CancellationToken::new(),
             ),
-            tables,
             consistent_point: Lsn::new(1),
         }
         .with_cancellation(token.clone());
-        assert_eq!(names(snapshot.tables()), ["public.a"]);
 
         token.cancel();
         let err = snapshot.next_row().await.unwrap_err();
@@ -481,12 +509,15 @@ mod tests {
         assert!(!matches!(err, ReplicationError::Config(_)), "{err:?}");
     }
 
+    /// The capture owns its inputs, so it can be spawned while the stream keeps sending feedback.
     #[tokio::test]
-    async fn capture_aligned_refuses_a_physical_stream() {
+    async fn capture_aligned_leaves_the_stream_free_and_refuses_a_physical_stream() {
         let config = crate::stream::ReplicationStreamConfig::builder("s", "p")
             .with_slot_type(SlotType::Physical);
-        let stream = crate::stream::tests::create_test_stream(config);
-        let err = match stream.capture_aligned(&[("public", "a")]).await {
+        let mut stream = crate::stream::tests::create_test_stream(config);
+        let capture = tokio::spawn(stream.capture_aligned(&[("public", "a")]));
+        stream.send_feedback().await.unwrap();
+        let err = match capture.await.unwrap() {
             Ok(_) => panic!("a physical stream has no publication to copy through"),
             Err(e) => e,
         };
