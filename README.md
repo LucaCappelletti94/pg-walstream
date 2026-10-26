@@ -17,7 +17,7 @@ A high-performance Rust library for PostgreSQL logical and physical replication 
 - **Pure-Rust Backend (default)**: The default `rustls-tls` backend needs no libpq and no OpenSSL, using `aws-lc-rs` for hardware-accelerated TLS (AES-NI, AVX2, SHA-NI). 
 - **TLS/SSL Support**: All PostgreSQL SSL modes (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`)
 - **Authentication**: Cleartext, MD5, and SCRAM-SHA-256 authentication methods
-- **Streaming Transactions**: Support for streaming large transactions (protocol v2+)
+- **Streaming Transactions**: Support for streaming large transactions (protocol v2+). Each streamed change carries the xid of its subtransaction in `ChangeEvent::xid`, so a `StreamAbort` for a rolled-back savepoint names exactly the changes to drop
 - **Two-Phase Commit**: Prepared transaction support (protocol v3+)
 - **Parallel Streaming**: Multi-stream parallel replication (protocol v4+)
 - **Zero-Copy Operations**: Efficient buffer management using the `bytes` crate with drain-loop batch queue optimization. The libpq backend copies each COPY message into a reusable `BytesMut` buffer, then reference-counts it downstream as `Bytes` (no per-message heap allocation after warmup)

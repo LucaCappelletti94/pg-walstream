@@ -3042,6 +3042,7 @@ mod tests {
             },
             lsn: Lsn::new(100),
             metadata: None,
+            xid: None,
         };
         let result: crate::error::Result<UserModel> = event.deserialize_data();
         assert!(result.is_err());
@@ -3055,6 +3056,7 @@ mod tests {
             event_type: crate::types::EventType::StreamStop,
             lsn: Lsn::new(100),
             metadata: None,
+            xid: None,
         };
         let result: crate::error::Result<UserModel> = event.deserialize_data();
         assert!(result.is_err());

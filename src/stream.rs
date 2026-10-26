@@ -2780,6 +2780,7 @@ mod reached_stop_lsn_tests {
             },
             lsn: Lsn::new(end),
             metadata: None,
+            xid: None,
         }
     }
     fn stream_commit(end: u64) -> ChangeEvent {
@@ -2792,6 +2793,7 @@ mod reached_stop_lsn_tests {
             },
             lsn: Lsn::new(end),
             metadata: None,
+            xid: None,
         }
     }
     fn commit_prepared(end: u64) -> ChangeEvent {
@@ -2806,6 +2808,7 @@ mod reached_stop_lsn_tests {
             },
             lsn: Lsn::new(end),
             metadata: None,
+            xid: None,
         }
     }
     fn insert(lsn: u64) -> ChangeEvent {
@@ -9372,6 +9375,7 @@ pub(crate) mod tests {
             },
             lsn: crate::types::Lsn::new(0x1000),
             metadata: None,
+            xid: None,
         };
         let mut es = create_event_stream_with_inflight(Ok(event));
 
@@ -9436,6 +9440,7 @@ pub(crate) mod tests {
             },
             lsn: crate::types::Lsn::new(0x1000),
             metadata: None,
+            xid: None,
         };
 
         let mut event_stream = create_event_stream_with_inflight(Ok(event));
@@ -9628,6 +9633,7 @@ pub(crate) mod tests {
             },
             lsn: crate::types::Lsn::new(0x2000),
             metadata: None,
+            xid: None,
         };
         event_stream.state.park_with_result(Ok(event));
 
