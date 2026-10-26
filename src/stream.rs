@@ -1052,7 +1052,7 @@ impl LogicalReplicationStream {
     ///
     /// Returns `Ok(None)` once every transaction whose [`commit_lsn`](crate::EventType::commit_lsn) lies below `boundary` has been delivered: either the next commit-carrying event is at or past it, which is kept and returned first by the next read, or a keepalive has reported the server past it. The usual `boundary` is an [`AlignedSnapshot`](crate::AlignedSnapshot)'s consistent point, applied once this returns `None`.
     ///
-    /// Streamed chunks and `PREPARE` carry no commit position, so they may still arrive before `None`, and a transaction is applied at its commit event. A reconnect replays from the acknowledged position, so acknowledge every event delivered before `None` prior to applying the copy.
+    /// Streamed chunks, `BeginPrepare` through `Prepare`, and `StreamPrepare` carry no commit position, so they can arrive before `None` for a transaction committed at or past `boundary`. [`AlignedSnapshot`](crate::AlignedSnapshot) describes how to merge such a stream with its copy. A reconnect replays from the acknowledged position, so acknowledge every event delivered before `None` prior to applying the copy.
     pub async fn next_event_before(
         &mut self,
         boundary: Lsn,
@@ -1136,29 +1136,8 @@ impl LogicalReplicationStream {
         &mut self,
         cancellation_token: &CancellationToken,
     ) -> Result<RawXLogData> {
-        match self.next_raw_event_until(cancellation_token, None).await? {
-            Some(raw) => Ok(raw),
-            None => unreachable!("a read without a boundary never stops at one"),
-        }
-    }
-
-    /// [`next_raw_event`](Self::next_raw_event) with the boundary of [`next_event_before`](Self::next_event_before).
-    pub async fn next_raw_event_before(
-        &mut self,
-        boundary: Lsn,
-        cancellation_token: &CancellationToken,
-    ) -> Result<Option<RawXLogData>> {
-        self.next_raw_event_until(cancellation_token, Some(boundary))
-            .await
-    }
-
-    async fn next_raw_event_until(
-        &mut self,
-        cancellation_token: &CancellationToken,
-        boundary: Option<Lsn>,
-    ) -> Result<Option<RawXLogData>> {
-        let Some(data) = self.next_wal_frame(cancellation_token, boundary).await? else {
-            return Ok(None);
+        let Some(data) = self.next_wal_frame(cancellation_token, None).await? else {
+            unreachable!("a read without a boundary never stops at one");
         };
         let raw = self.decode_raw_frame(data)?;
 
@@ -1169,7 +1148,7 @@ impl LogicalReplicationStream {
             }
         }
 
-        Ok(Some(raw))
+        Ok(raw)
     }
 
     /// Check connection health and attempt recovery if needed
@@ -1421,7 +1400,7 @@ impl LogicalReplicationStream {
     }
 
     /// [`next_event_with_retry`](Self::next_event_with_retry) with the boundary of [`next_event_before`](Self::next_event_before).
-    pub(crate) async fn next_event_with_retry_until(
+    async fn next_event_with_retry_until(
         &mut self,
         cancellation_token: &CancellationToken,
         boundary: Option<Lsn>,
@@ -2342,18 +2321,6 @@ impl EventSource for EventStream {
     }
 }
 
-/// [`EventSource`] for the drivers that stop at a boundary; `Ok(None)` means it was reached.
-pub(crate) trait BoundedEventSource: EventSource {
-    async fn recv_before(&mut self, boundary: Lsn) -> Result<Option<ChangeEvent>>;
-}
-
-impl BoundedEventSource for EventStream {
-    #[inline]
-    async fn recv_before(&mut self, boundary: Lsn) -> Result<Option<ChangeEvent>> {
-        self.next_event_before(boundary).await
-    }
-}
-
 /// Drive `source`, running `handler` per event and advancing the applied LSN
 /// only after the handler resolves `Ok`. `Cancelled` recv → graceful `Ok(())`.
 pub(crate) async fn for_each_event_impl<S, F, Fut>(source: &mut S, mut handler: F) -> Result<()>
@@ -2751,13 +2718,6 @@ impl<'a> EventStreamRef<'a> {
     pub async fn next(&mut self) -> Result<ChangeEvent> {
         self.inner
             .next_event_with_retry(&self.cancellation_token)
-            .await
-    }
-
-    /// [`LogicalReplicationStream::next_event_before`] with this stream's retry and recovery.
-    pub async fn next_before(&mut self, boundary: Lsn) -> Result<Option<ChangeEvent>> {
-        self.inner
-            .next_event_with_retry_until(&self.cancellation_token, Some(boundary))
             .await
     }
 }
@@ -8443,6 +8403,7 @@ pub(crate) mod tests {
         stream
     }
 
+    use crate::protocol::{ColumnData, ColumnInfo, StreamingReplicationMessage};
     use crate::LogicalReplicationMessage;
 
     fn wal(payload: &[u8]) -> bytes::Bytes {
@@ -8455,6 +8416,90 @@ pub(crate) mod tests {
 
     fn encoded(message: LogicalReplicationMessage) -> bytes::Bytes {
         wal(&crate::encode_message_to_bytes(&message, 4))
+    }
+
+    fn in_stream(message: LogicalReplicationMessage, xid: u32) -> bytes::Bytes {
+        let message = StreamingReplicationMessage::new_streaming(message, xid);
+        wal(&crate::encode_streaming_message_to_bytes(&message, 4))
+    }
+
+    fn begin(final_lsn: u64) -> bytes::Bytes {
+        wal(&build_begin_payload(final_lsn, 1))
+    }
+
+    fn protocol_v4_config() -> ReplicationStreamConfig {
+        ReplicationStreamConfig::new(
+            "test_slot".to_string(),
+            "test_publication".to_string(),
+            4,
+            StreamingMode::On,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            RetryConfig::default(),
+        )
+    }
+
+    /// `B`, `C`, `c` and `K` laid out field by field from the pgoutput message formats, with distinct commit and end positions.
+    fn golden_commit_frames() -> [(bytes::Bytes, Lsn); 4] {
+        let ts = 0x7777_u64.to_be_bytes();
+        let xid = 9_u32.to_be_bytes();
+        let begin = [&b"B"[..], &0x1_0000_0A00_u64.to_be_bytes(), &ts, &xid].concat();
+        let commit = [
+            &[b'C', 0][..],
+            &0x1_0000_0B00_u64.to_be_bytes(),
+            &0x1_0000_0B80_u64.to_be_bytes(),
+            &ts,
+        ]
+        .concat();
+        let stream_commit = [
+            &b"c"[..],
+            &xid,
+            &[0],
+            &0x1_0000_0C00_u64.to_be_bytes(),
+            &0x1_0000_0C80_u64.to_be_bytes(),
+            &ts,
+        ]
+        .concat();
+        let commit_prepared = [
+            &[b'K', 0][..],
+            &0x1_0000_0D00_u64.to_be_bytes(),
+            &0x1_0000_0D80_u64.to_be_bytes(),
+            &ts,
+            &xid,
+            b"g\0",
+        ]
+        .concat();
+        [
+            (wal(&begin), Lsn::new(0x1_0000_0A00)),
+            (wal(&commit), Lsn::new(0x1_0000_0B00)),
+            (wal(&stream_commit), Lsn::new(0x1_0000_0C00)),
+            (wal(&commit_prepared), Lsn::new(0x1_0000_0D00)),
+        ]
+    }
+
+    #[test]
+    fn frame_commit_lsn_reads_the_offsets_of_the_pgoutput_formats() {
+        for (frame, commit) in golden_commit_frames() {
+            assert_eq!(
+                frame_commit_lsn(&frame),
+                Some(commit),
+                "{}",
+                frame[25] as char
+            );
+        }
+    }
+
+    /// The byte peek and the parser agree on every commit-carrying message.
+    #[tokio::test]
+    async fn frame_commit_lsn_agrees_with_the_parsed_event() {
+        for (frame, commit) in golden_commit_frames() {
+            let mut stream =
+                create_test_stream_with_frames(protocol_v4_config(), vec![frame.clone()]);
+            let event = stream.next_event(&CancellationToken::new()).await.unwrap();
+            assert_eq!(event.event_type.commit_lsn(), Some(commit), "{event:?}");
+            assert_eq!(frame_commit_lsn(&frame), event.event_type.commit_lsn());
+        }
     }
 
     /// The byte-level peek reads the commit position, never `end_lsn`, and only from commit-carrying messages.
@@ -8524,97 +8569,280 @@ pub(crate) mod tests {
         assert_eq!(frame_commit_lsn(&wal(&[])), None);
     }
 
-    /// Commits below the boundary flow, the first at or past it is held, and a plain read delivers it.
+    async fn commit_before(stream: &mut LogicalReplicationStream, boundary: u64) -> Option<Lsn> {
+        stream
+            .next_event_before(Lsn::new(boundary), &CancellationToken::new())
+            .await
+            .unwrap()
+            .map(|event| {
+                event
+                    .event_type
+                    .commit_lsn()
+                    .expect("a commit-carrying event")
+            })
+    }
+
+    async fn next_commit(stream: &mut LogicalReplicationStream) -> Option<Lsn> {
+        let event = stream.next_event(&CancellationToken::new()).await.unwrap();
+        event.event_type.commit_lsn()
+    }
+
+    /// One below the boundary is delivered, the boundary itself is held, and repeated reads at the boundary consume nothing.
     #[tokio::test]
-    async fn next_event_before_holds_the_first_commit_at_or_past_the_boundary() {
+    async fn the_boundary_is_held_and_one_below_it_is_delivered() {
         let frames = vec![
-            wal(&build_begin_payload(0x100, 1)),
-            wal(&build_commit_payload(0x100, 0x120)),
-            wal(&build_begin_payload(0x200, 2)),
+            begin(0x1FF),
+            wal(&build_commit_payload(0x1FF, 0x220)),
+            begin(0x200),
+            begin(0x300),
         ];
         let mut stream = create_test_stream_with_frames(create_test_config(), frames);
-        let cancel = CancellationToken::new();
-        let boundary = Lsn::new(0x200);
 
-        let first = stream.next_event_before(boundary, &cancel).await.unwrap();
         assert_eq!(
-            first.unwrap().event_type.commit_lsn(),
-            Some(Lsn::new(0x100))
+            commit_before(&mut stream, 0x200).await,
+            Some(Lsn::new(0x1FF))
         );
-        let second = stream.next_event_before(boundary, &cancel).await.unwrap();
-        assert!(matches!(
-            second.unwrap().event_type,
-            EventType::Commit { .. }
-        ));
-
-        // The seeded frames are exhausted, so a second `None` proves the held frame answered without a read.
-        assert!(stream
-            .next_event_before(boundary, &cancel)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(stream
-            .next_event_before(boundary, &cancel)
-            .await
-            .unwrap()
-            .is_none());
-
-        let held = stream.next_event(&cancel).await.unwrap();
-        assert_eq!(held.event_type.commit_lsn(), Some(Lsn::new(0x200)));
+        assert_eq!(
+            commit_before(&mut stream, 0x200).await,
+            Some(Lsn::new(0x1FF))
+        );
+        assert_eq!(commit_before(&mut stream, 0x200).await, None);
+        assert_eq!(commit_before(&mut stream, 0x200).await, None);
+        assert_eq!(next_commit(&mut stream).await, Some(Lsn::new(0x200)));
+        assert_eq!(next_commit(&mut stream).await, Some(Lsn::new(0x300)));
     }
 
+    /// A lower boundary keeps the held commit, and a higher one delivers it.
     #[tokio::test]
-    async fn a_held_commit_below_a_later_boundary_is_delivered() {
-        let frames = vec![wal(&build_begin_payload(0x300, 1))];
+    async fn a_held_commit_waits_for_a_boundary_above_it() {
+        let mut stream =
+            create_test_stream_with_frames(create_test_config(), vec![begin(0x300), begin(0x400)]);
+
+        assert_eq!(commit_before(&mut stream, 0x300).await, None);
+        assert_eq!(commit_before(&mut stream, 0x100).await, None);
+        assert_eq!(
+            commit_before(&mut stream, 0x400).await,
+            Some(Lsn::new(0x300))
+        );
+        assert_eq!(commit_before(&mut stream, 0x400).await, None);
+        assert_eq!(next_commit(&mut stream).await, Some(Lsn::new(0x400)));
+    }
+
+    /// Only a keepalive at or past the boundary ends the wait, and it is remembered without reading on.
+    #[tokio::test]
+    async fn a_keepalive_ends_the_wait_only_at_or_past_the_boundary() {
+        let frames = vec![
+            keepalive(0x1FF),
+            begin(0x150),
+            keepalive(0x200),
+            begin(0x100),
+        ];
         let mut stream = create_test_stream_with_frames(create_test_config(), frames);
-        let cancel = CancellationToken::new();
 
-        assert!(stream
-            .next_event_before(Lsn::new(0x200), &cancel)
-            .await
-            .unwrap()
-            .is_none());
-        let event = stream
-            .next_event_before(Lsn::new(0x400), &cancel)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(event.event_type.commit_lsn(), Some(Lsn::new(0x300)));
+        assert_eq!(
+            commit_before(&mut stream, 0x200).await,
+            Some(Lsn::new(0x150))
+        );
+        assert_eq!(commit_before(&mut stream, 0x200).await, None);
+        assert_eq!(commit_before(&mut stream, 0x200).await, None);
+        assert_eq!(next_commit(&mut stream).await, Some(Lsn::new(0x100)));
     }
 
-    /// With no published commit after the boundary, a keepalive at or past it ends the wait, and is remembered.
     #[tokio::test]
-    async fn a_keepalive_at_or_past_the_boundary_ends_the_wait() {
-        let frames = vec![keepalive(0x150), keepalive(0x200)];
+    async fn cancellation_keeps_the_held_commit() {
+        let mut stream = create_test_stream_with_frames(create_test_config(), vec![begin(0x300)]);
+        assert_eq!(commit_before(&mut stream, 0x200).await, None);
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let err = stream
+            .next_event_before(Lsn::new(0x200), &cancelled)
+            .await
+            .unwrap_err();
+        assert!(err.is_cancelled(), "{err}");
+        assert!(stream
+            .next_event(&cancelled)
+            .await
+            .unwrap_err()
+            .is_cancelled());
+        assert_eq!(next_commit(&mut stream).await, Some(Lsn::new(0x300)));
+    }
+
+    /// Without a boundary nothing is held, whatever the commit or keepalive positions.
+    #[tokio::test]
+    async fn a_read_without_a_boundary_never_holds() {
+        let frames = vec![begin(u64::MAX), keepalive(u64::MAX), begin(0x10)];
         let mut stream = create_test_stream_with_frames(create_test_config(), frames);
-        let cancel = CancellationToken::new();
-        let boundary = Lsn::new(0x200);
-
-        assert!(stream
-            .next_event_before(boundary, &cancel)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(stream
-            .next_event_before(boundary, &cancel)
-            .await
-            .unwrap()
-            .is_none());
+        assert_eq!(next_commit(&mut stream).await, Some(Lsn::new(u64::MAX)));
+        assert_eq!(next_commit(&mut stream).await, Some(Lsn::new(0x10)));
     }
 
     #[tokio::test]
-    async fn next_raw_event_before_holds_the_frame_for_the_raw_reader() {
+    async fn the_raw_reader_receives_a_held_frame() {
         let payload = build_begin_payload(0x300, 1);
         let mut stream = create_test_stream_with_frames(create_test_config(), vec![wal(&payload)]);
-        let cancel = CancellationToken::new();
+        assert_eq!(commit_before(&mut stream, 0x300).await, None);
+        let raw = stream
+            .next_raw_event(&CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(&raw.data[..], &payload[..]);
+    }
 
-        assert!(stream
-            .next_raw_event_before(Lsn::new(0x300), &cancel)
+    fn relation() -> LogicalReplicationMessage {
+        LogicalReplicationMessage::Relation {
+            relation_id: 42,
+            namespace: Arc::from("public"),
+            relation_name: Arc::from("t"),
+            replica_identity: b'd',
+            columns: vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
+        }
+    }
+
+    fn insert() -> LogicalReplicationMessage {
+        LogicalReplicationMessage::Insert {
+            relation_id: 42,
+            tuple: TupleData::new(vec![ColumnData::text(b"1".to_vec())]),
+        }
+    }
+
+    /// Read up to the boundary, returning what was delivered before `None`.
+    async fn drain_before(stream: &mut LogicalReplicationStream, boundary: u64) -> Vec<EventType> {
+        let mut delivered = Vec::new();
+        while let Some(event) = stream
+            .next_event_before(Lsn::new(boundary), &CancellationToken::new())
             .await
             .unwrap()
-            .is_none());
-        let raw = stream.next_raw_event(&cancel).await.unwrap();
-        assert_eq!(&raw.data[..], &payload[..]);
+        {
+            delivered.push(event.event_type);
+        }
+        delivered
+    }
+
+    /// A streamed transaction's chunks precede the `None` while its commit past the boundary is held.
+    #[tokio::test]
+    async fn streamed_chunks_arrive_before_the_boundary_and_the_commit_after_it() {
+        let frames = vec![
+            encoded(relation()),
+            encoded(LogicalReplicationMessage::StreamStart {
+                xid: 9,
+                first_segment: true,
+            }),
+            in_stream(insert(), 9),
+            encoded(LogicalReplicationMessage::StreamStop),
+            encoded(LogicalReplicationMessage::StreamCommit {
+                xid: 9,
+                flags: 0,
+                commit_lsn: 0x300,
+                end_lsn: 0x380,
+                timestamp: 0,
+            }),
+        ];
+        let mut stream = create_test_stream_with_frames(protocol_v4_config(), frames);
+
+        let delivered = drain_before(&mut stream, 0x200).await;
+        assert!(
+            matches!(
+                delivered.as_slice(),
+                [
+                    EventType::Relation { .. },
+                    EventType::StreamStart {
+                        transaction_id: 9,
+                        ..
+                    },
+                    EventType::Insert { .. },
+                    EventType::StreamStop,
+                ]
+            ),
+            "{delivered:?}"
+        );
+        assert_eq!(next_commit(&mut stream).await, Some(Lsn::new(0x300)));
+    }
+
+    /// `BeginPrepare` through `Prepare` precede the `None`, even with a prepare position past the boundary, and `CommitPrepared` is held.
+    #[tokio::test]
+    async fn a_prepared_transaction_arrives_before_the_boundary_and_its_commit_after_it() {
+        let frames = vec![
+            encoded(relation()),
+            encoded(LogicalReplicationMessage::BeginPrepare {
+                prepare_lsn: 0x250,
+                end_lsn: 0x260,
+                timestamp: 0,
+                xid: 9,
+                gid: "g".to_string(),
+            }),
+            encoded(insert()),
+            encoded(LogicalReplicationMessage::Prepare {
+                flags: 0,
+                prepare_lsn: 0x250,
+                end_lsn: 0x260,
+                timestamp: 0,
+                xid: 9,
+                gid: "g".to_string(),
+            }),
+            encoded(LogicalReplicationMessage::CommitPrepared {
+                flags: 0,
+                commit_lsn: 0x300,
+                end_lsn: 0x380,
+                timestamp: 0,
+                xid: 9,
+                gid: "g".to_string(),
+            }),
+        ];
+        let mut stream = create_test_stream_with_frames(protocol_v4_config(), frames);
+
+        let delivered = drain_before(&mut stream, 0x200).await;
+        assert!(
+            matches!(
+                delivered.as_slice(),
+                [
+                    EventType::Relation { .. },
+                    EventType::BeginPrepare { .. },
+                    EventType::Insert { .. },
+                    EventType::Prepare { .. },
+                ]
+            ),
+            "{delivered:?}"
+        );
+        assert_eq!(next_commit(&mut stream).await, Some(Lsn::new(0x300)));
+    }
+
+    #[tokio::test]
+    async fn reset_barrier_forgets_the_held_frame_and_the_keepalive_position() {
+        let frames = vec![keepalive(0x150), begin(0x300)];
+        let mut stream = create_test_stream_with_frames(create_test_config(), frames);
+        assert_eq!(commit_before(&mut stream, 0x200).await, None);
+        assert!(stream.held.is_some());
+        assert_eq!(stream.keepalive_wal_end, Lsn::new(0x150));
+
+        stream.reset_barrier();
+        assert!(stream.held.is_none());
+        assert_eq!(stream.keepalive_wal_end, Lsn::new(0));
+    }
+
+    /// The retrying reader stops at the boundary like the plain one and hands the held commit to the next read.
+    #[tokio::test]
+    async fn event_stream_stops_at_the_boundary_and_delivers_the_held_commit_next() {
+        let frames = vec![
+            begin(0x100),
+            wal(&build_commit_payload(0x100, 0x120)),
+            begin(0x200),
+            begin(0x300),
+        ];
+        let mut events = create_test_stream_with_frames(create_test_config(), frames)
+            .into_stream(CancellationToken::new());
+        let boundary = Lsn::new(0x200);
+
+        let mut below = Vec::new();
+        while let Some(event) = events.next_event_before(boundary).await.unwrap() {
+            below.push(event.event_type.commit_lsn());
+        }
+        assert_eq!(below, [Some(Lsn::new(0x100)), Some(Lsn::new(0x100))]);
+        assert!(events.next_event_before(boundary).await.unwrap().is_none());
+        let held = events.next_event().await.unwrap();
+        assert_eq!(held.event_type.commit_lsn(), Some(Lsn::new(0x200)));
+        let next = events.next_event().await.unwrap();
+        assert_eq!(next.event_type.commit_lsn(), Some(Lsn::new(0x300)));
     }
 
     fn begin_event(final_lsn: u64) -> ChangeEvent {
