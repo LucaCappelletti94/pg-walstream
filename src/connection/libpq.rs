@@ -36,8 +36,9 @@ use bytes::{BufMut, Bytes, BytesMut};
 use pq_sys::*;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
-use std::os::raw::c_void;
+use std::os::raw::{c_char, c_void};
 use std::os::unix::io::{BorrowedFd, OwnedFd, RawFd};
+use std::time::Duration;
 use std::{ptr, slice};
 use tokio::io::unix::AsyncFd;
 use tokio_util::sync::CancellationToken;
@@ -192,6 +193,16 @@ const READ_BUF_INITIAL_CAPACITY: usize = 256 * 1024;
 /// A backup manifest is a few hundred KiB; chunking bounds libpq's output buffer and keeps each message far below the server's 1 GiB message limit.
 const COPY_IN_CHUNK: usize = 64 * 1024;
 
+/// libpq's `PG_ENCODING_UTF8` (libpq-fe.h), which pq-sys does not export.
+const PG_ENCODING_UTF8: i32 = 6;
+
+/// The `PQconnectStartParams` option arrays and the `connect_timeout` deadline.
+type ConnectOptions = (
+    Vec<CString>,
+    Vec<Option<CString>>,
+    Option<tokio::time::Instant>,
+);
+
 /// Safe wrapper around PostgreSQL connection for replication
 ///
 /// This struct provides a safe, high-level interface to libpq for PostgreSQL
@@ -242,6 +253,85 @@ pub struct PgReplicationConnection {
     /// Set by [`PgReplicationConnection::mark_dead`]. Cleared by `start_replication`.
     dead: bool,
 }
+
+/// A half-open connection from `connect_async`; dropping it runs `PQfinish`,
+/// so a cancelled future releases the socket promptly.
+struct HalfOpenConnection {
+    conn: *mut PGconn,
+    /// The deadline the conninfo's `connect_timeout` puts on the whole poll loop.
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl HalfOpenConnection {
+    /// The connection's current error text, or a placeholder when libpq has none.
+    fn error_message(&self) -> String {
+        unsafe {
+            let error_ptr = PQerrorMessage(self.conn);
+            if error_ptr.is_null() {
+                "Unknown connection error".to_string()
+            } else {
+                CStr::from_ptr(error_ptr).to_string_lossy().into_owned()
+            }
+        }
+    }
+
+    /// Wait until the socket is ready in the direction `PQconnectPoll` asked for, or the deadline passes.
+    async fn await_socket(&mut self, writable: bool) -> Result<()> {
+        let sock: RawFd = unsafe { PQsocket(self.conn) };
+        if sock < 0 {
+            return Err(PgReplicationConnection::classify_connect_error(
+                self.error_message(),
+            ));
+        }
+        // Registered afresh on every wait: libpq may replace its socket between polls, even under the same descriptor number.
+        // SAFETY: `sock` was just returned by `PQsocket` on a connection this struct owns, so it stays open for the call.
+        let async_fd = register_dup(unsafe { BorrowedFd::borrow_raw(sock) }).map_err(|e| {
+            ReplicationError::protocol(format!(
+                "Failed to register PostgreSQL socket with the reactor: {e}"
+            ))
+        })?;
+        let ready = async {
+            if writable {
+                async_fd.writable().await.map(drop)
+            } else {
+                async_fd.readable().await.map(drop)
+            }
+        };
+        let ready = match self.deadline {
+            Some(deadline) => tokio::select! {
+                () = tokio::time::sleep_until(deadline) => {
+                    return Err(ReplicationError::transient_connection(
+                        "PostgreSQL connection failed (transient): connection to server timed out"
+                            .to_string(),
+                    ));
+                }
+                ready = ready => ready,
+            },
+            None => ready.await,
+        };
+        ready.map_err(|e| {
+            ReplicationError::protocol(format!("Failed to wait for socket readiness: {e}"))
+        })
+    }
+
+    /// Hand the established connection over, so dropping `self` no longer finishes it.
+    fn into_established(mut self) -> *mut PGconn {
+        std::mem::replace(&mut self.conn, ptr::null_mut())
+    }
+}
+
+impl Drop for HalfOpenConnection {
+    fn drop(&mut self) {
+        if !self.conn.is_null() {
+            unsafe { PQfinish(self.conn) };
+        }
+    }
+}
+
+// SAFETY: `HalfOpenConnection` exclusively owns the `PGconn` produced by
+// `PQconnectStartParams`, and only this struct touches it, so moving it to
+// another thread is safe.
+unsafe impl Send for HalfOpenConnection {}
 
 impl PgReplicationConnection {
     /// Create a new PostgreSQL connection for logical replication
@@ -310,26 +400,7 @@ impl PgReplicationConnection {
             unsafe { PQfinish(conn) };
 
             // Categorize the connection error
-            let error_msg_lower = error_msg.to_lowercase();
-            if error_msg_lower.contains("authentication failed")
-                || error_msg_lower.contains("password authentication failed")
-                || error_msg_lower.contains("role does not exist")
-            {
-                return Err(ReplicationError::authentication(format!(
-                    "PostgreSQL authentication failed: {error_msg}"
-                )));
-            } else if error_msg_lower.contains("database does not exist")
-                || error_msg_lower.contains("invalid connection string")
-                || error_msg_lower.contains("unsupported")
-            {
-                return Err(ReplicationError::permanent_connection(format!(
-                    "PostgreSQL connection failed (permanent): {error_msg}"
-                )));
-            } else {
-                return Err(ReplicationError::transient_connection(format!(
-                    "PostgreSQL connection failed (transient): {error_msg}"
-                )));
-            }
+            return Err(Self::classify_connect_error(error_msg));
         }
 
         // Force UTF-8 client_encoding so quote_literal/quote_ident's ASCII-only escaping is multibyte-safe regardless of the server/locale default , parity with the native backend, which sends client_encoding=UTF8 in its startup packet. Under an ASCII-unsafe encoding (SJIS/GBK/BIG5) a raw lead byte could otherwise fuse with an escaping quote and reopen a literal breakout.
@@ -367,6 +438,211 @@ impl PgReplicationConnection {
             read_buf: BytesMut::with_capacity(READ_BUF_INITIAL_CAPACITY),
             dead: false,
         })
+    }
+
+    /// Non-blocking [`connect`](Self::connect), driving `PQconnectPoll` on `AsyncFd` socket readiness. Dropping the future closes the half-open connection.
+    ///
+    /// `connect_timeout` bounds the whole attempt. `PQconnectdb` restarts it for each host of a multi-host connection string, which libpq's public API leaves no way to reproduce.
+    pub async fn connect_async(conninfo: &str) -> Result<Self> {
+        // Ensure libpq is properly initialized
+        unsafe {
+            let library_version = PQlibVersion();
+            debug!("Using libpq version: {}", library_version);
+        }
+
+        let c_conninfo = CString::new(conninfo)
+            .map_err(|e| ReplicationError::connection(format!("Invalid connection string: {e}")))?;
+
+        let (keys, values, deadline) = Self::parse_connect_options(&c_conninfo)?;
+
+        // The raw-pointer vecs are dropped before the first await, so the future stays `Send`.
+        let conn = {
+            // `PQconnectStartParams` walks both arrays until a NULL sentinel.
+            let mut key_ptrs: Vec<*const c_char> = keys.iter().map(|k| k.as_ptr()).collect();
+            key_ptrs.push(ptr::null());
+            let mut value_ptrs: Vec<*const c_char> = values
+                .iter()
+                .map(|v| match v {
+                    Some(v) => v.as_ptr(),
+                    None => ptr::null(),
+                })
+                .collect();
+            value_ptrs.push(ptr::null());
+
+            // SAFETY: `key_ptrs` and `value_ptrs` are NULL-terminated arrays of valid C
+            // strings owned by `keys` and `values`, which outlive the block.
+            // `expand_dbname` is 0 because `PQconninfoParse` already expanded the connection string, so a database named like a connection string stays a name.
+            unsafe { PQconnectStartParams(key_ptrs.as_ptr(), value_ptrs.as_ptr(), 0) }
+        };
+
+        if conn.is_null() {
+            return Err(ReplicationError::transient_connection(
+                "Failed to allocate PostgreSQL connection object".to_string(),
+            ));
+        }
+
+        let mut half_open = HalfOpenConnection { conn, deadline };
+
+        // Parameter errors leave the connection already failed.
+        if unsafe { PQstatus(half_open.conn) } == ConnStatusType::CONNECTION_BAD {
+            return Err(Self::classify_connect_error(half_open.error_message()));
+        }
+
+        // libpq documents the first wait as if `PQconnectPoll` had returned WRITING.
+        let mut flag = PostgresPollingStatusType::PGRES_POLLING_WRITING;
+        loop {
+            match flag {
+                PostgresPollingStatusType::PGRES_POLLING_OK => break,
+                PostgresPollingStatusType::PGRES_POLLING_FAILED => {
+                    return Err(Self::classify_connect_error(half_open.error_message()));
+                }
+                // `PGRES_POLLING_ACTIVE` comes only from `PQconnectPollExtended`, and re-polling after readability recovers it.
+                PostgresPollingStatusType::PGRES_POLLING_READING
+                | PostgresPollingStatusType::PGRES_POLLING_ACTIVE
+                | PostgresPollingStatusType::PGRES_POLLING_WRITING => {
+                    half_open
+                        .await_socket(flag == PostgresPollingStatusType::PGRES_POLLING_WRITING)
+                        .await?;
+                    flag = unsafe { PQconnectPoll(half_open.conn) };
+                }
+            }
+        }
+        let conn = half_open.into_established();
+
+        // The startup packet forced `client_encoding=UTF8`; `options=-c
+        // client_encoding=...` could have overridden it, so verify.
+        if unsafe { PQclientEncoding(conn) } != PG_ENCODING_UTF8 {
+            unsafe { PQfinish(conn) };
+            return Err(ReplicationError::permanent_connection(
+                "Failed to set client_encoding=UTF8".to_string(),
+            ));
+        }
+
+        // Check server version - logical replication requires PostgreSQL 14+
+        let server_version = unsafe { PQserverVersion(conn) };
+        if server_version < 140000 {
+            unsafe { PQfinish(conn) };
+            return Err(ReplicationError::permanent_connection(format!(
+                "PostgreSQL version {server_version} is not supported. Logical replication requires PostgreSQL 14+"
+            )));
+        }
+
+        debug!("Connected to PostgreSQL server version: {}", server_version);
+
+        Ok(Self {
+            conn,
+
+            async_fd: None,
+            copy: CopyMode::Idle,
+            read_buf: BytesMut::with_capacity(READ_BUF_INITIAL_CAPACITY),
+            dead: false,
+        })
+    }
+
+    /// Parse a connection string into the option arrays `PQconnectStartParams`
+    /// takes, forcing `client_encoding` to UTF-8 and computing the `connect_timeout` deadline.
+    fn parse_connect_options(c_conninfo: &CString) -> Result<ConnectOptions> {
+        let mut conninfo_err: *mut c_char = ptr::null_mut();
+        // SAFETY: `c_conninfo` is a valid NUL-terminated C string that stays
+        // alive for the call.
+        let options = unsafe { PQconninfoParse(c_conninfo.as_ptr(), &mut conninfo_err) };
+        if options.is_null() {
+            let msg = Self::take_conninfo_error(&mut conninfo_err);
+            return Err(Self::classify_connect_error(format!(
+                "Invalid connection string: {msg}"
+            )));
+        }
+
+        let mut keys: Vec<CString> = Vec::new();
+        let mut values: Vec<Option<CString>> = Vec::new();
+        let mut connect_timeout: Option<CString> = None;
+
+        // SAFETY: `options` is libpq's array of `PQconninfoOption`, terminated by an
+        // entry with a NULL keyword. Keywords and values are NUL-terminated strings
+        // owned by the array, copied out before `PQconninfoFree` releases it.
+        unsafe {
+            let mut opt = options;
+            while !(*opt).keyword.is_null() {
+                let keyword = CStr::from_ptr((*opt).keyword);
+                let val = (!(*opt).val.is_null()).then(|| CStr::from_ptr((*opt).val).to_owned());
+                if keyword.to_bytes() == b"client_encoding" {
+                    // The startup packet is the non-blocking stand-in for `PQsetClientEncoding`.
+                    keys.push(keyword.to_owned());
+                    values.push(Some(c"UTF8".to_owned()));
+                } else {
+                    if keyword.to_bytes() == b"connect_timeout" {
+                        connect_timeout = val.clone();
+                    }
+                    keys.push(keyword.to_owned());
+                    values.push(val);
+                }
+                opt = opt.add(1);
+            }
+            PQconninfoFree(options);
+        }
+
+        // `PQconnectPoll` leaves `connect_timeout` to the caller's loop, as `PQconnectdb` does.
+        let deadline = Self::connect_deadline(connect_timeout.as_deref())?;
+        Ok((keys, values, deadline))
+    }
+
+    /// The deadline `connect_timeout` sets, with libpq's rules: whole seconds, `0` or negative disables it, and `1` is raised to `2`.
+    fn connect_deadline(value: Option<&CStr>) -> Result<Option<tokio::time::Instant>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let secs: i64 = value
+            .to_str()
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| {
+                Self::classify_connect_error(format!(
+                    "invalid connection string: invalid value \"{}\" for parameter \"connect_timeout\"",
+                    value.to_string_lossy()
+                ))
+            })?;
+        Ok(u64::try_from(secs)
+            .ok()
+            .filter(|&secs| secs > 0)
+            .map(|secs| tokio::time::Instant::now() + Duration::from_secs(secs.max(2))))
+    }
+
+    /// Take and free the error string `PQconninfoParse` left in `conninfo_err`.
+    fn take_conninfo_error(conninfo_err: &mut *mut c_char) -> String {
+        let ptr = std::mem::replace(conninfo_err, ptr::null_mut());
+        if ptr.is_null() {
+            return "unknown error".to_string();
+        }
+        // SAFETY: `ptr` is the NUL-terminated message libpq allocated for `PQconninfoParse`, which must be released with `PQfreemem` exactly once.
+        unsafe {
+            let msg = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+            PQfreemem(ptr.cast::<c_void>());
+            msg
+        }
+    }
+
+    /// Classify a connect failure message the way `connect` does.
+    fn classify_connect_error(error_msg: String) -> ReplicationError {
+        let error_msg_lower = error_msg.to_lowercase();
+        if error_msg_lower.contains("authentication failed")
+            || error_msg_lower.contains("password authentication failed")
+            || error_msg_lower.contains("role does not exist")
+        {
+            ReplicationError::authentication(format!(
+                "PostgreSQL authentication failed: {error_msg}"
+            ))
+        } else if error_msg_lower.contains("database does not exist")
+            || error_msg_lower.contains("invalid connection string")
+            || error_msg_lower.contains("unsupported")
+        {
+            ReplicationError::permanent_connection(format!(
+                "PostgreSQL connection failed (permanent): {error_msg}"
+            ))
+        } else {
+            ReplicationError::transient_connection(format!(
+                "PostgreSQL connection failed (transient): {error_msg}"
+            ))
+        }
     }
 
     /// Execute a replication command (like IDENTIFY_SYSTEM)
@@ -2339,6 +2615,62 @@ mod tests {
         assert_eq!(conn.handle_cancellation().unwrap().unwrap(), &b"second"[..]);
     }
 
+    /// A silent server must neither block the runtime nor keep the socket open once the caller gives up,
+    /// and the startup packet must have reached it before the connect gave up.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_async_yields_to_a_timeout_and_releases_its_socket() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conninfo = format!(
+            "host=127.0.0.1 port={port} dbname=async user=async sslmode=disable gssencmode=disable connect_timeout=10"
+        );
+        let silent_server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut startup = Vec::new();
+            sock.read_to_end(&mut startup).await.unwrap();
+            startup
+        });
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&ticks);
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            PgReplicationConnection::connect_async(&conninfo),
+        )
+        .await;
+        assert!(result.is_err(), "the outer timeout must fire");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "an unrelated task made no progress"
+        );
+        heartbeat.abort();
+
+        let startup = tokio::time::timeout(Duration::from_secs(2), silent_server)
+            .await
+            .expect("dropping the connect future must close its socket")
+            .unwrap();
+        assert!(
+            !startup.is_empty(),
+            "the startup packet never reached the server before the timeout"
+        );
+    }
+
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2656,6 +2988,42 @@ mod tests {
         );
         let err = result.err().expect("expected error");
         assert!(err.to_string().contains("null bytes"));
+    }
+
+    /// `PQconnectPoll` never enforces `connect_timeout`, so `connect_async` must
+    /// enforce the conninfo's deadline itself, the way `PQconnectdb` does. A
+    /// silent socket keeps the poll loop pending until the deadline fires.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_connect_async_enforces_connect_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Accept and stay silent for long enough that only the deadline can end
+        // the connection.
+        let silent = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(sock);
+        });
+
+        let conninfo = format!(
+            "host=127.0.0.1 port={port} dbname=async user=async sslmode=disable connect_timeout=1"
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            PgReplicationConnection::connect_async(&conninfo),
+        )
+        .await
+        .expect("the connect_timeout deadline must fire before the guard timeout");
+        let err = match result {
+            Ok(_) => panic!("connect_async must fail on a silent socket"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected a connect-timeout error, got: {err}"
+        );
+        silent.abort();
     }
 
     // === PgResult::get_bytes / get_bytes_owned ===
