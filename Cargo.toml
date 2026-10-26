@@ -197,6 +197,10 @@ path = "integration-tests/require_existing_slot.rs"
 name = "unread_stream_feedback"
 path = "integration-tests/unread_stream_feedback.rs"
 
+[[test]]
+name = "startup_metadata"
+path = "integration-tests/startup_metadata.rs"
+
 [[bench]]
 name = "wal_pipeline"
 harness = false

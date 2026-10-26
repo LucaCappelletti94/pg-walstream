@@ -409,6 +409,16 @@ pub fn build_read_slot_sql(slot_name: &str) -> Result<String> {
     Ok(format!("READ_REPLICATION_SLOT {};", quoted_slot))
 }
 
+/// Build the query reading a slot's `confirmed_flush_lsn` as text, which a `replication=database` walsender accepts until `START_REPLICATION`.
+#[cfg(any(feature = "libpq", feature = "rustls-tls"))]
+#[inline]
+pub(crate) fn build_slot_confirmed_flush_sql(slot_name: &str) -> Result<String> {
+    Ok(format!(
+        "SELECT confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots WHERE slot_name = {}",
+        quote_literal(slot_name)?
+    ))
+}
+
 /// Build the SQL for `START_REPLICATION SLOT ... LOGICAL`.
 ///
 /// # Example
