@@ -918,17 +918,10 @@ impl PgReplicationConnection {
         Ok(())
     }
 
-    /// Blocking, like every other command on this type. Only the data loop
-    /// ([`copy_out_next`](Self::copy_out_next)) is async.
-    ///
-    /// `PQexec` runs **before** `initialize_async_socket`, matching
-    /// `start_replication`: `PQsetnonblocking` must not precede the blocking
-    /// `PQexec`.
-    pub(crate) fn copy_out_begin(&mut self, sql: &str) -> Result<()> {
-        // Must be fully idle, not merely "not already in a COPY OUT": `PQexec`
-        // on a connection pinned in CopyBoth is a protocol violation. The old
-        // two-boolean shape could not express this check, because the
-        // replication flag was a separate field this guard never read.
+    /// Start a COPY OUT stream, issuing the query through [`exec_async`] instead of a blocking `PQexec`.
+    pub(crate) async fn copy_out_begin_async(&mut self, sql: &str) -> Result<()> {
+        // Must be fully idle, not merely "not already in a COPY OUT": a query
+        // on a connection pinned in CopyBoth is a protocol violation.
         match self.copy {
             CopyMode::Idle => {}
             CopyMode::Out(_) => {
@@ -944,20 +937,16 @@ impl PgReplicationConnection {
             }
         }
 
-        // Idle is not enough on its own. A failed `copy_out_next` returns the
-        // mode to Idle *and* marks the connection dead, because the rest of the
-        // relation is still queued — so without this check the `PQexec` below
-        // would be answered by the previous COPY's leftovers and fail against
-        // the wrong statement. `start_replication` resets `dead`; this path
-        // deliberately does not, because nothing here re-establishes the
-        // connection.
+        // A failed `copy_out_next` returns the mode to Idle *and* marks the
+        // connection dead, because the rest of the relation is still queued —
+        // so the query would be answered by the previous COPY's leftovers.
         if !self.is_alive() {
             return Err(ReplicationError::protocol(
                 "cannot start a COPY OUT on a connection that is no longer usable".to_string(),
             ));
         }
 
-        let result = self.exec(sql)?;
+        let result = self.exec_async(sql).await?;
         if !matches!(result.status(), ExecStatusType::PGRES_COPY_OUT) {
             return Err(ReplicationError::protocol(format!(
                 "{sql} did not enter COPY OUT mode (status {:?})",
@@ -1129,7 +1118,7 @@ impl PgReplicationConnection {
     /// its socket itself on a fatal error (`pqDropConnection`) while the `PGconn`
     /// stays alive, and `AsyncFd` requires its fd to stay open until dropped.
     ///
-    /// Every entry point that enters a COPY calls this, and `copy_out_begin` is
+    /// Every entry point that enters a COPY calls this, and `copy_out_begin_async` is
     /// the one that can legitimately run **more than once per connection**: a
     /// COPY OUT completes, its epilogue is drained, and the connection returns to
     /// idle ready for the next table. The replication entry points are protected
@@ -2925,20 +2914,16 @@ mod tests {
         assert!(format!("{err}").contains("no COPY OUT stream"), "{err}");
     }
 
-    /// A replication connection is pinned in CopyBoth, so `PQexec`-ing the
-    /// `COPY` query is already a protocol violation. The old two-boolean shape
-    /// could not express this guard: it read only the COPY OUT flag, so a
-    /// replication connection went straight through to `exec`.
-    ///
-    /// The null connection has a null `PGconn`, so reaching `exec` would be a
-    /// segfault rather than a wrong answer — the test passing at all is what
-    /// proves the guard returns first.
+    /// A replication connection is pinned in CopyBoth, so a `COPY` query on it is
+    /// already a protocol violation. The null connection has a null `PGconn`, so
+    /// reaching `exec_async` would be a segfault rather than a wrong answer — the
+    /// test passing at all is what proves the guard returns first.
     #[test]
-    fn test_copy_out_begin_rejects_a_replication_connection() {
+    fn test_copy_out_begin_async_rejects_a_replication_connection() {
         let mut conn = PgReplicationConnection::null_for_testing();
         conn.copy = CopyMode::Replication(CopyStream::default());
 
-        let err = conn.copy_out_begin("COPY t TO STDOUT").unwrap_err();
+        let err = block_on(conn.copy_out_begin_async("COPY t TO STDOUT")).unwrap_err();
         assert!(
             format!("{err}").contains("streaming replication"),
             "expected the replication-mode rejection, got: {err}"
@@ -2949,9 +2934,44 @@ mod tests {
         );
     }
 
+    /// A dead connection still has the previous COPY's relation queued, so the
+    /// alive check must reject before the query is issued.
+    #[test]
+    fn test_copy_out_begin_async_rejects_a_dead_connection() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        conn.mark_dead();
+
+        let err = block_on(conn.copy_out_begin_async("COPY t TO STDOUT")).unwrap_err();
+        assert!(
+            format!("{err}").contains("no longer usable"),
+            "expected the dead-connection rejection, got: {err}"
+        );
+        assert!(
+            matches!(conn.copy, CopyMode::Idle),
+            "a rejected COPY OUT must leave the mode idle"
+        );
+    }
+
+    /// A second COPY OUT on the same connection is rejected before the query.
+    #[test]
+    fn test_copy_out_begin_async_rejects_a_second_stream() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        conn.copy = CopyMode::Out(CopyStream::default());
+
+        let err = block_on(conn.copy_out_begin_async("COPY t TO STDOUT")).unwrap_err();
+        assert!(
+            format!("{err}").contains("already in progress"),
+            "expected the in-progress rejection, got: {err}"
+        );
+        assert!(
+            conn.copy.is_out(),
+            "a rejected COPY OUT must leave the existing stream intact"
+        );
+    }
+
     /// `initialize_async_socket` must be idempotent. Before the socket was dup'd,
     /// `AsyncFd::new` on an already-registered fd returned EEXIST, and
-    /// `copy_out_begin` reaches it once per table — which is how every multi-table
+    /// `copy_out_begin_async` reaches it once per table — which is how every multi-table
     /// snapshot on this backend used to fail. It now guards against a redundant
     /// dup + registration instead.
     ///

@@ -389,8 +389,9 @@ jobs:
             # state machine over `wire::read_message` on the native backend and
             # `PQgetCopyData` on libpq, with nothing shared between the two. Each
             # backend sends `unread_stream_feedback`'s status update through its
-            # own writer.
-            error_classification|upload_manifest|initial_snapshot|require_existing_slot|unread_stream_feedback|aligned_snapshot)
+            # own writer. `startup_metadata` drives each backend's own non-blocking
+            # startup path.
+            error_classification|upload_manifest|initial_snapshot|require_existing_slot|unread_stream_feedback|aligned_snapshot|startup_metadata)
               variants=("" "--no-default-features --features libpq") ;;
             *) variants=("") ;;
           esac

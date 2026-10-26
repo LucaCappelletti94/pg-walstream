@@ -1037,8 +1037,8 @@ async fn streamed_and_prepared_transactions_straddling_c_merge_at_their_commit()
     .expect("test timed out");
 }
 
-/// Dropping a capture future does not stop its setup, which ends, and releases
-/// its walsender and slot, once the transaction it waits for ends.
+/// A dropped capture's walsender keeps waiting on the server, and it and its
+/// slot go once the transaction it waits for ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a live PostgreSQL with wal_level = logical"]
 async fn a_dropped_capture_leaves_no_walsender_or_slot_once_the_blocker_ends() {

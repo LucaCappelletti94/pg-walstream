@@ -329,7 +329,7 @@ copy.finish()?;
 
 `next_event_before(C)` returns `None` once every transaction committed below `C` has been delivered. Decide each transaction at its commit event. Below `C`, apply it without the copied tables' rows, which the copy already holds. At or past `C`, apply it in full, after the copy. A transaction that ends in `RollbackPrepared` or in a `StreamAbort` of the whole transaction is dropped. A `StreamAbort` of a subtransaction drops the buffered changes whose `ChangeEvent::xid` equals its `subtransaction_xid`. Streamed chunks, `BeginPrepare` through `Prepare`, and `StreamPrepare` can arrive before the `None` for a transaction that commits at or past `C`, so buffer each transaction until its commit event. `EventStream::next_event_before` does the same with retries.
 
-The capture holds a second replication connection and a temporary slot until slot creation ends. Slot creation waits for the transactions open when it starts and can also wait for ones that start during the wait. Dropping the capture future does not stop it, so abandoned captures behind a long transaction keep their walsenders and can exhaust `max_wal_senders`. `with_cancellation` covers only the copy loop. The copy pins `xmin` until `finish()`.
+The capture holds a second replication connection and a temporary slot until slot creation ends. Slot creation waits for the transactions open when it starts and can also wait for ones that start during the wait. Dropping the capture future closes its connections, but a slot creation already sent keeps its walsender waiting on the server, so abandoned captures behind a long transaction can exhaust `max_wal_senders`. `with_cancellation` covers only the copy loop. The copy pins `xmin` until `finish()`.
 
 ## Connection Timeouts
 
@@ -341,7 +341,7 @@ Three conninfo options bound three different things, and they are easy to mistak
 | `keepalives_idle` / `_interval` / `_count` | seconds | An **idle** connection. Defaults `120`/`10`/`3` — roughly 150 s to notice a peer that vanished while nothing was in flight. |
 | `tcp_user_timeout` | **milliseconds** | An unacknowledged **write**. This is the only one that bounds a blocking round-trip — including the `DROP_REPLICATION_SLOT` that snapshot cleanup runs from `Drop`. Linux-family only; `0` (the default) disables it. |
 
-If a stuck destructor or a wedged control-plane command matters to you, `tcp_user_timeout` is the knob — keepalives will not do it, because a connection waiting for a reply is not idle.
+If a stuck destructor or a wedged blocking command matters to you, `tcp_user_timeout` is the knob — keepalives will not do it, because a connection waiting for a reply is not idle. The async stream methods (`new`, `start`, `snapshot`, and reconnects) never block their thread, so an enclosing `tokio::time::timeout` also bounds them. A connection whose command was cancelled refuses further commands and must be dropped.
 
 > Set it deliberately. An aggressive `tcp_user_timeout` tears down healthy long-lived replication connections during ordinary transient stalls, which is usually worse than the delay it prevents.
 
