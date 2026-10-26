@@ -369,7 +369,9 @@ jobs:
             # `aligned_snapshot` join them: their COPY-out reader is a hand-rolled
             # state machine over `wire::read_message` on the native backend and
             # `PQgetCopyData` on libpq, with nothing shared between the two.
-            error_classification|upload_manifest|initial_snapshot|aligned_snapshot)
+            # `startup_metadata` drives each backend's own non-blocking startup
+            # path.
+            error_classification|upload_manifest|initial_snapshot|aligned_snapshot|startup_metadata)
               variants=("" "--no-default-features --features libpq") ;;
             *) variants=("") ;;
           esac

@@ -274,7 +274,7 @@ impl ReplicationConnectionRetry {
                 )));
             }
 
-            match PgReplicationConnection::connect(&self.connection_string) {
+            match PgReplicationConnection::connect_async(&self.connection_string).await {
                 Ok(conn) => {
                     let elapsed = start_time.elapsed();
                     info!(

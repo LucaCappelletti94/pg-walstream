@@ -326,7 +326,7 @@ Three conninfo options bound three different things, and they are easy to mistak
 | `keepalives_idle` / `_interval` / `_count` | seconds | An **idle** connection. Defaults `120`/`10`/`3` — roughly 150 s to notice a peer that vanished while nothing was in flight. |
 | `tcp_user_timeout` | **milliseconds** | An unacknowledged **write**. This is the only one that bounds a blocking round-trip — including the `DROP_REPLICATION_SLOT` that snapshot cleanup runs from `Drop`. Linux-family only; `0` (the default) disables it. |
 
-If a stuck destructor or a wedged control-plane command matters to you, `tcp_user_timeout` is the knob — keepalives will not do it, because a connection waiting for a reply is not idle.
+If a stuck destructor or a wedged blocking command matters to you, `tcp_user_timeout` is the knob — keepalives will not do it, because a connection waiting for a reply is not idle. The async stream methods (`new`, `start`, `snapshot`, and reconnects) never block their thread, so an enclosing `tokio::time::timeout` also bounds them. A connection whose command was cancelled refuses further commands and must be dropped.
 
 > Set it deliberately. An aggressive `tcp_user_timeout` tears down healthy long-lived replication connections during ordinary transient stalls, which is usually worse than the delay it prevents.
 

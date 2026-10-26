@@ -243,8 +243,8 @@ impl ServerIdentity {
     }
 
     /// Identify the server on the far end of `connection`, failing closed on a malformed reply.
-    fn identify(connection: &mut PgReplicationConnection) -> Result<Self> {
-        let result = connection.identify_system()?;
+    async fn identify(connection: &mut PgReplicationConnection) -> Result<Self> {
+        let result = connection.identify_system_async().await?;
         Self::from_identify_system(&result).ok_or_else(|| {
             ReplicationError::permanent_connection(
                 "IDENTIFY_SYSTEM returned no usable system identifier and timeline, so the \
@@ -767,13 +767,12 @@ impl LogicalReplicationStream {
             with_connect_timeout(connection_string, config.connection_timeout),
         );
 
-        // Establish initial connection with retry and enforce timeout
-        let mut connection = timeout_or_error(
-            config.connection_timeout,
-            retry_handler.connect_with_retry(),
-        )
+        let (connection, identity) = timeout_or_error(config.connection_timeout, async {
+            let mut connection = retry_handler.connect_with_retry().await?;
+            let identity = ServerIdentity::identify(&mut connection).await?;
+            Ok((connection, identity))
+        })
         .await?;
-        let identity = ServerIdentity::identify(&mut connection)?;
         info!(
             "Connected to system {} on timeline {}",
             identity.system_id, identity.timeline
@@ -820,7 +819,7 @@ impl LogicalReplicationStream {
     /// Returns an error when the stream is already streaming, when the query fails, or when the slot is not a logical slot.
     pub async fn slot_confirmed_flush_lsn(&mut self) -> Result<Option<Lsn>> {
         let sql = crate::sql_builder::build_slot_confirmed_flush_sql(&self.config.slot_name)?;
-        let result = self.connection.exec(&sql)?;
+        let result = self.connection.exec_async(&sql).await?;
         if result.ntuples() == 0 {
             return Ok(None);
         }
@@ -857,7 +856,8 @@ impl LogicalReplicationStream {
         }
         let result = self
             .connection
-            .exec(&format!("TIMELINE_HISTORY {timeline}"))?;
+            .exec_async(&format!("TIMELINE_HISTORY {timeline}"))
+            .await?;
         let content = (result.ntuples() == 1)
             .then(|| result.get_value(0, 1))
             .flatten()
@@ -929,12 +929,16 @@ impl LogicalReplicationStream {
             SlotType::Physical => None,
         };
 
-        match self.connection.create_replication_slot_with_options(
-            &self.config.slot_name,
-            self.config.slot_type,
-            output_plugin,
-            &self.config.slot_options,
-        ) {
+        match self
+            .connection
+            .create_replication_slot_with_options_async(
+                &self.config.slot_name,
+                self.config.slot_type,
+                output_plugin,
+                &self.config.slot_options,
+            )
+            .await
+        {
             Ok(result) => {
                 // CREATE_REPLICATION_SLOT returns: slot_name(0), consistent_point(1), snapshot_name(2), output_plugin(3)
                 //
@@ -1037,7 +1041,8 @@ impl LogicalReplicationStream {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect::<Vec<_>>();
         self.connection
-            .start_replication(&self.config.slot_name, start_lsn, &options_ref)?;
+            .start_replication_async(&self.config.slot_name, start_lsn, &options_ref)
+            .await?;
 
         self.reset_barrier();
         if !self.slot.is_present() {
@@ -1401,7 +1406,7 @@ impl LogicalReplicationStream {
         .await?;
 
         // A reconnect can land somewhere other than where we left off, and the stored LSN is only meaningful on the original cluster and timeline. A malformed reply fails closed with `PermanentConnection`, never `ReplicationSlot`, which would send an operator to drop a healthy slot.
-        let current = ServerIdentity::identify(&mut self.connection)?;
+        let current = ServerIdentity::identify(&mut self.connection).await?;
         self.check_server_identity(&current)?;
 
         // Temporary slots are dropped when the connection dies.
@@ -1460,9 +1465,10 @@ impl LogicalReplicationStream {
         // already active for PID" after a network blip, which clears on its own
         // once `wal_sender_timeout` (default 60 s) reaps the old walsender: a
         // routine, self-healing condition that must not kill the stream.
-        if let Err(e) =
-            self.connection
-                .start_replication(&self.config.slot_name, last_lsn, &options_ref)
+        if let Err(e) = self
+            .connection
+            .start_replication_async(&self.config.slot_name, last_lsn, &options_ref)
+            .await
         {
             self.connection.mark_dead();
             return Err(e);
@@ -1953,7 +1959,40 @@ impl LogicalReplicationStream {
     ///
     /// Failure to drop is logged, not returned: this runs on an error path and
     /// must not mask the error that got us here.
+    ///
+    /// Blocking, for `Drop` paths. Async error paths use [`discard_replication_slot_async`](Self::discard_replication_slot_async).
     pub(crate) fn discard_replication_slot(&mut self) {
+        if self.owns_slot() {
+            let dropped = self
+                .connection
+                .drop_replication_slot(&self.config.slot_name, false);
+            self.record_discard(dropped);
+        }
+    }
+
+    /// Non-blocking [`discard_replication_slot`](Self::discard_replication_slot).
+    pub(crate) async fn discard_replication_slot_async(&mut self) {
+        if self.owns_slot() {
+            let dropped = self
+                .connection
+                .drop_replication_slot_async(&self.config.slot_name, false)
+                .await;
+            self.record_discard(dropped);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn slot_is_present(&self) -> bool {
+        self.slot.is_present()
+    }
+
+    /// Whether the server has a slot by this stream's name, read on the stream's own connection.
+    pub(crate) async fn slot_exists_on_server(&mut self) -> Result<bool> {
+        let sql = crate::sql_builder::build_slot_confirmed_flush_sql(&self.config.slot_name)?;
+        Ok(self.connection.exec_async(&sql).await?.ntuples() > 0)
+    }
+
+    fn owns_slot(&self) -> bool {
         // Only ever drop a slot this stream created. A pre-existing slot belongs
         // to whoever made it, and dropping one would destroy their subscription's
         // position — the caller's own WAL retention along with it.
@@ -1962,18 +2001,19 @@ impl LogicalReplicationStream {
         // it replaced was set to `true` on *both* the create and the
         // "already exists" branch, so it could not distinguish the two: guarding
         // on it would have passed here and dropped the operator's slot anyway.
-        // Until now the guarantee lived at the single call site, which happened
-        // to check an unrelated field first.
-        if !matches!(self.slot, SlotState::Ours { .. }) {
+        let ours = matches!(self.slot, SlotState::Ours { .. });
+        if !ours {
             debug!(
                 "Not dropping replication slot {}: this stream did not create it",
                 self.config.slot_name
             );
-            return;
         }
+        ours
+    }
 
-        let slot_name = self.config.slot_name.clone();
-        match self.connection.drop_replication_slot(&slot_name, false) {
+    fn record_discard(&mut self, dropped: Result<()>) {
+        let slot_name = &self.config.slot_name;
+        match dropped {
             Ok(()) => {
                 info!("Dropped replication slot {slot_name} after a failed snapshot attempt");
                 self.slot = SlotState::Absent;
@@ -2885,17 +2925,10 @@ impl<'a> EventStreamRef<'a> {
 /// Fold `connection_timeout` into the connection string as `connect_timeout`
 /// unless the caller already set one.
 ///
-/// This is what gives [`timeout_or_error`] teeth. `connect_with_retry` calls the
-/// *blocking* `PgReplicationConnection::connect` inline, so the `tokio::time::timeout`
-/// wrapped around it can only fire at the backoff `await` *between* attempts — a
-/// single connect parked against a peer that completes the TCP handshake and then
-/// goes silent is unbounded, and no caller-side timeout can reach it.
-///
-/// `connect_timeout` is the bound that does work, on both backends: the native
-/// backend wraps the whole handshake in its own `tokio::time::timeout` driven by
-/// the worker's runtime (where the timer *is* polled), and libpq honours the
-/// keyword natively. A caller who sets it explicitly wins — this only supplies a
-/// default. `Duration::ZERO` means "no timeout", matching libpq, so it adds nothing.
+/// The outer [`timeout_or_error`] bounds the whole retry loop. `connect_timeout`
+/// also bounds each attempt, so the per-attempt handshake gives up on its own
+/// even when nothing above it is waiting. A caller who sets it explicitly wins.
+/// `Duration::ZERO` means "no timeout", matching libpq, so it adds nothing.
 fn with_connect_timeout(conn_str: &str, timeout: Duration) -> String {
     if timeout.is_zero() || conn_str.contains("connect_timeout") {
         return conn_str.to_string();
@@ -10344,5 +10377,131 @@ mod stop_at_lsn_config_tests {
     fn with_stop_at_lsn_sets_target() {
         let cfg = ReplicationStreamConfig::builder("slot", "pub").with_stop_at_lsn(0x2000u64);
         assert_eq!(cfg.stop_at_lsn, Some(Lsn::new(0x2000)));
+    }
+}
+
+#[cfg(all(test, feature = "rustls-tls"))]
+mod startup_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// What happened when an operation raced a 50 ms outer timeout.
+    struct Raced {
+        timed_out: bool,
+        elapsed: Duration,
+        heartbeat_ticks: usize,
+    }
+
+    /// Race `op` against a 50 ms timeout beside a 5 ms heartbeat on a fresh runtime thread, panicking if that thread stays blocked for five seconds.
+    fn race_outer_timeout<F, Fut>(multi_thread: bool, op: F) -> Raced
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future,
+    {
+        let (report, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = if multi_thread {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+            }
+            .unwrap();
+            let ticks = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&ticks);
+            let (timed_out, elapsed) = runtime.block_on(async move {
+                let heartbeat = tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+                tokio::task::yield_now().await;
+                let started = Instant::now();
+                let result = tokio::time::timeout(Duration::from_millis(50), op()).await;
+                let elapsed = started.elapsed();
+                heartbeat.abort();
+                (result.is_err(), elapsed)
+            });
+            let _ = report.send(Raced {
+                timed_out,
+                elapsed,
+                heartbeat_ticks: ticks.load(Ordering::Relaxed),
+            });
+        });
+        outcome
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the operation blocked its runtime past the outer timeout")
+    }
+
+    fn assert_outer_timeout_fired(raced: &Raced) {
+        assert!(
+            raced.timed_out,
+            "the operation finished before the outer timeout, after {:?}",
+            raced.elapsed
+        );
+        assert!(
+            raced.elapsed < Duration::from_millis(500),
+            "the outer timeout fired late, after {:?}",
+            raced.elapsed
+        );
+        assert!(
+            raced.heartbeat_ticks > 0,
+            "an unrelated task made no progress"
+        );
+    }
+
+    /// A peer that completes the TCP handshake in the kernel and never answers the startup packet.
+    fn silent_conninfo() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conninfo = format!(
+            "host=127.0.0.1 port={port} user=probe dbname=probe sslmode=disable \
+             connect_timeout=2 replication=database"
+        );
+        (listener, conninfo)
+    }
+
+    fn single_attempt_config() -> ReplicationStreamConfig {
+        ReplicationStreamConfig::builder("probe", "probe")
+            .with_connection_timeout(Duration::from_secs(10))
+            .with_retry_config(RetryConfig {
+                max_attempts: 1,
+                ..RetryConfig::default()
+            })
+    }
+
+    fn new_against_a_silent_peer(multi_thread: bool) -> Raced {
+        let (listener, conninfo) = silent_conninfo();
+        race_outer_timeout(multi_thread, move || async move {
+            let _listener = listener;
+            LogicalReplicationStream::new(&conninfo, single_attempt_config()).await
+        })
+    }
+
+    #[test]
+    fn new_yields_to_an_outer_timeout_on_a_current_thread_runtime() {
+        assert_outer_timeout_fired(&new_against_a_silent_peer(false));
+    }
+
+    #[test]
+    fn new_yields_to_an_outer_timeout_on_a_multi_thread_runtime() {
+        assert_outer_timeout_fired(&new_against_a_silent_peer(true));
+    }
+
+    #[test]
+    fn start_yields_to_an_outer_timeout_when_the_server_stops_answering() {
+        let (connection, peer) = PgReplicationConnection::silent_for_testing();
+        let mut stream = tests::create_test_stream(single_attempt_config());
+        stream.connection = connection;
+        let raced = race_outer_timeout(false, move || async move {
+            let _peer = peer;
+            stream.start(None).await
+        });
+        assert_outer_timeout_fired(&raced);
     }
 }

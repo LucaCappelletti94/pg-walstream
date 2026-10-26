@@ -1560,14 +1560,12 @@ impl NativeConnection {
         Ok(result)
     }
 
-    /// Blocking, like every other command on this type ([`exec`](Self::exec),
-    /// `run_query`). Only the data loop ([`copy_out_next`](Self::copy_out_next))
-    /// is async, and that is the part that can run for minutes.
+    /// Issue a `COPY ... TO STDOUT` without blocking. Only the following data loop ([`copy_out_next`](Self::copy_out_next)) can run for minutes.
     ///
     /// On success the transport is parked at the first `CopyData` frame:
     /// `simple_query` consumes the `CopyOutResponse` and stops *without* reading
     /// `ReadyForQuery`.
-    pub(crate) fn copy_out_begin(&mut self, sql: &str) -> Result<()> {
+    pub(crate) async fn copy_out_begin_async(&mut self, sql: &str) -> Result<()> {
         // Must be fully idle, not merely "not already in a COPY OUT": issuing a
         // Query while the transport sits in CopyBoth is a protocol violation,
         // and the old two-flag shape let that through because the replication
@@ -1600,7 +1598,7 @@ impl NativeConnection {
             ));
         }
 
-        let result = self.exec(sql)?;
+        let result = self.exec_async(sql).await?;
         if result.status() != &NativeResultStatus::CopyOut {
             return Err(ReplicationError::protocol(format!(
                 "{sql} did not enter COPY OUT mode (status {:?})",
@@ -2507,7 +2505,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copy_out_begin_rejects_a_second_stream() {
         let (mut conn, _server) = inline_conn_in_copy_out().await;
-        let err = conn.copy_out_begin("COPY t TO STDOUT").unwrap_err();
+        let err = conn
+            .copy_out_begin_async("COPY t TO STDOUT")
+            .await
+            .unwrap_err();
         assert!(format!("{err}").contains("already in progress"), "{err}");
     }
 
@@ -2516,24 +2517,20 @@ mod tests {
     /// missed this: the guard only inspected the COPY OUT field, so a
     /// replication connection sailed past it into `exec`.
     ///
-    /// The timeout is as much the point as the assertion: `copy_out_begin` is
-    /// blocking, so a regressed guard does not return a wrong answer — it
-    /// *hangs*, writing a Query the walsender will never read.
+    /// The timeout is as much the point as the assertion: a regressed guard does
+    /// not return a wrong answer, it *hangs* writing a Query the walsender will
+    /// never read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copy_out_begin_rejects_a_replication_connection() {
         let (mut conn, _server) = inline_conn_in_copy_out().await;
         conn.copy = CopyMode::Replication;
 
-        let (conn, result) = tokio::time::timeout(
+        let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || {
-                let result = conn.copy_out_begin("COPY t TO STDOUT");
-                (conn, result)
-            }),
+            conn.copy_out_begin_async("COPY t TO STDOUT"),
         )
         .await
-        .expect("the guard must reject before any I/O; a hang means it fell through to exec")
-        .unwrap();
+        .expect("the guard must reject before any I/O; a hang means it fell through to exec");
 
         let err = result.unwrap_err();
         assert!(
