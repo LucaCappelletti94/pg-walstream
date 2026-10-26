@@ -1,3 +1,10 @@
+# The `coverage` job uploads the unit report, one `integration` cell the integration report.
+codecov:
+  notify:
+    after_n_builds: 2
+comment:
+  after_n_builds: 2
+
 coverage:
   status:
     project:

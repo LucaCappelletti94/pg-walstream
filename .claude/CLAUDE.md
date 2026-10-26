@@ -154,8 +154,7 @@ read as a CodSpeed regression.
 - Code coverage ≥ 90% total lines, via `cargo llvm-cov --lib --features derive`
 - `cargo doc --no-deps --all-features` warning-free
 - Integration tests require PostgreSQL 15+ with logical replication enabled
-- `src/connection/libpq.rs` is not compiled during the coverage run, so code
-  there is invisible to the gate — cover it with integration tests
+- The 90% gate reads only the default-backend unit pass, so `src/connection/libpq.rs` is invisible to it. Codecov merges both backends' unit passes with the integration suites run on PostgreSQL 18.
 - A new `integration-tests/*.rs` file needs a `[[test]]` stanza in `Cargo.toml`
 
 ## Integration Tests
