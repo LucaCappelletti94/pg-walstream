@@ -1,13 +1,11 @@
 //! Byte-faithful `pgoutput` encoder: the inverse of [`LogicalReplicationParser`]
-//! (`parse(encode(msg)) == msg`), distinct from [`ChangeEvent::encode`] (which
-//! writes the crate's own framing, not `pgoutput`).
+//! (`parse(encode(msg)) == msg`).
 //!
 //! Timestamps are the raw on-wire `i64`, stored verbatim by the parser.
 //! `encode_message` writes non-streaming framing. `encode_streaming_message`
 //! adds the in-stream xid prefix to data messages inside a streamed transaction.
 //!
 //! [`LogicalReplicationParser`]: crate::protocol::LogicalReplicationParser
-//! [`ChangeEvent::encode`]: crate::types::ChangeEvent::encode
 
 mod base;
 mod streaming;

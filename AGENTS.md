@@ -50,7 +50,7 @@ src/
 ├── router.rs        # WalRouter: typed async by-table event router (convenience)
 ├── deserializer.rs  # serde Deserializer: RowData → user structs
 ├── column_value.rs  # ColumnValue / RowData
-├── types.rs         # EventType/ChangeEvent, Lsn, wire encode/decode
+├── types.rs         # EventType/ChangeEvent, Lsn
 ├── lsn.rs           # thread-safe SharedLsnFeedback (atomic CAS)
 ├── copy_text.rs     # COPY TEXT decoder (crate-private; snapshot only)
 ├── snapshot/        # managed initial snapshot — see below
@@ -147,9 +147,6 @@ consistency with the three above. New public structs get the same treatment —
 `SnapshotOutcome`, an enum that deliberately omits it; the reasoning is on the
 type itself in `src/snapshot/mod.rs`, so do not add it there for consistency
 either.
-
-`ChangeEvent::encode`/`decode` are deprecated since 0.9.0 in favour of a binary
-serde codec; do not extend them.
 
 ## Benchmarks and the perf gate
 
