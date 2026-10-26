@@ -167,10 +167,7 @@ read as a CodSpeed regression. If a `parse_*` regression appears, check
 passes on default, `derive` and `libpq` · coverage ≥ 90% total lines
 (`cargo llvm-cov --lib --features derive`) · `cargo doc` warning-free.
 
-`src/connection/libpq.rs` is **not compiled** during the coverage run
-(`connection/mod.rs` gates it on `libpq` *without* `rustls-tls`), so code added
-there is invisible to the gate — it still has to pass the libpq clippy run and be
-covered by integration tests.
+The 90% gate reads only that default-backend unit pass, so `src/connection/libpq.rs` (gated on `libpq` *without* `rustls-tls` in `connection/mod.rs`) is invisible to it. Codecov receives the default and libpq unit passes merged, plus the integration suites run instrumented on PostgreSQL 18, and its patch check covers both backends.
 
 A new file under `integration-tests/` needs a matching `[[test]]` stanza in
 `Cargo.toml`; CI enumerates the directory and fails without it.

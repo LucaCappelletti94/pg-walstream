@@ -177,8 +177,8 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        # Coverage runs on the default rustls-tls backend (aws-lc-rs): cmake only.
-        sudo apt-get install -y cmake
+        # cmake for the default rustls-tls backend (aws-lc-rs), the rest for the libpq pass.
+        sudo apt-get install -y cmake libpq-dev libssl-dev pkg-config
 
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@cargo-llvm-cov
@@ -193,11 +193,12 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-coverage-
 
-    - name: Generate coverage report (lcov for Codecov)
-      run: cargo llvm-cov --lib --features derive --lcov --output-path lcov.info
+    - name: Measure unit tests (default backend)
+      run: cargo llvm-cov --no-report --lib --features derive
 
+    # The threshold applies to the default backend alone, so it is read before the libpq pass.
     - name: Generate coverage report (json for threshold check)
-      run: cargo llvm-cov --lib --features derive --json --output-path coverage.json
+      run: cargo llvm-cov report --json --output-path coverage.json
 
     - name: Check coverage threshold (minimum ${{ env.MIN_COVERAGE }}%)
       run: |
@@ -217,10 +218,17 @@ jobs:
           exit 1
         fi
 
+    - name: Measure unit tests (libpq backend)
+      run: cargo llvm-cov --no-report --lib --no-default-features --features libpq
+
+    - name: Generate coverage report (lcov for Codecov)
+      run: cargo llvm-cov report --lcov --output-path lcov.info
+
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v6
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6
       with:
         files: lcov.info
+        flags: unit
         fail_ci_if_error: false
         token: ${{ secrets.CODECOV_TOKEN }}
 
@@ -238,6 +246,10 @@ jobs:
       matrix:
         # pgoutput protocol v2 (streaming in-progress transactions) requires PG 15+
         pg_version: [15, 16, 17, 18]
+        # One cell runs the suites instrumented and uploads them to Codecov.
+        include:
+          - pg_version: 18
+            coverage: true
 
     services:
       postgres:
@@ -259,6 +271,12 @@ jobs:
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
+      with:
+        components: llvm-tools-preview
+
+    - name: Install cargo-llvm-cov
+      if: matrix.coverage
+      uses: taiki-e/install-action@c3076e6fa5aeb9a93daf1bd8eff73345250a8a9c # cargo-llvm-cov
 
     - name: Install dependencies
       run: |
@@ -341,6 +359,7 @@ jobs:
         DATABASE_URL_REGULAR: "postgresql://postgres:postgres@localhost:5432/test_walstream?connect_timeout=10"
         PGPASSWORD: postgres
         RUST_BACKTRACE: 1
+        TEST_RUNNER: ${{ matrix.coverage && 'cargo llvm-cov --no-report' || 'cargo test' }}
       # The suite list comes from the filesystem, so a new integration-tests/*.rs
       # runs automatically, and one that is missing its `[[test]]` target in
       # Cargo.toml fails here ("no test target named ...") instead of being
@@ -378,7 +397,7 @@ jobs:
             label="$suite${v:+ [$v]}"
             echo "::group::$label"
             timeout -k 30 600 \
-              cargo test --test "$suite" $v -- --ignored --nocapture --test-threads=1 \
+              $TEST_RUNNER --test "$suite" $v -- --ignored --nocapture --test-threads=1 \
               || failed+=("$label")
             echo "::endgroup::"
             # Drop every slot between suites: an orphan blocks WAL recycling and
@@ -398,6 +417,19 @@ jobs:
           exit 1
         fi
         echo "All integration suites passed."
+
+    - name: Generate coverage report (lcov for Codecov)
+      if: matrix.coverage && !cancelled()
+      run: cargo llvm-cov report --lcov --output-path lcov.info
+
+    - name: Upload coverage to Codecov
+      if: matrix.coverage && !cancelled()
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6
+      with:
+        files: lcov.info
+        flags: integration
+        fail_ci_if_error: false
+        token: ${{ secrets.CODECOV_TOKEN }}
 
   integration-ssl:
     name: SSL Integration Tests (PG ${{ matrix.pg_version }})
