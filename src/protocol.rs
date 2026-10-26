@@ -742,6 +742,22 @@ impl LogicalReplicationParser {
     ) -> Result<StreamingReplicationMessage> {
         let message_type = reader.read_u8()?;
 
+        // Inside a streamed chunk pgoutput writes, before each change, the xid of the (sub)transaction that made it.
+        let change_xid = match message_type {
+            message_types::RELATION
+            | message_types::INSERT
+            | message_types::UPDATE
+            | message_types::DELETE
+            | message_types::TRUNCATE
+            | message_types::TYPE
+            | message_types::MESSAGE
+                if self.protocol_version >= 2 && self.is_streaming() =>
+            {
+                Some(reader.read_u32()?)
+            }
+            _ => None,
+        };
+
         let message = match message_type {
             message_types::BEGIN => self.parse_begin_message(reader)?,
             message_types::COMMIT => self.parse_commit_message(reader)?,
@@ -783,7 +799,7 @@ impl LogicalReplicationParser {
             }
         };
 
-        let streaming_message = match self.streaming_context {
+        let streaming_message = match change_xid.or(self.streaming_context) {
             Some(xid) => StreamingReplicationMessage::new_streaming(message, xid),
             None => StreamingReplicationMessage::new(message),
         };
@@ -831,10 +847,6 @@ impl LogicalReplicationParser {
         &mut self,
         reader: &mut BufferReader,
     ) -> Result<LogicalReplicationMessage> {
-        if self.protocol_version >= 2 && self.is_streaming() {
-            let _xid = reader.read_u32()?;
-        }
-
         let relation_id = reader.read_u32()?;
         let namespace = reader.read_cstring_arc()?;
         let relation_name = reader.read_cstring_arc()?;
@@ -877,10 +889,6 @@ impl LogicalReplicationParser {
         &mut self,
         reader: &mut BufferReader,
     ) -> Result<LogicalReplicationMessage> {
-        if self.protocol_version >= 2 && self.is_streaming() {
-            let _xid = reader.read_u32()?;
-        }
-
         let relation_id = reader.read_u32()?;
         let tuple_type = reader.read_u8()?;
 
@@ -902,10 +910,6 @@ impl LogicalReplicationParser {
         &mut self,
         reader: &mut BufferReader,
     ) -> Result<LogicalReplicationMessage> {
-        if self.protocol_version >= 2 && self.is_streaming() {
-            let _xid = reader.read_u32()?;
-        }
-
         let relation_id = reader.read_u32()?;
 
         let mut old_tuple = None;
@@ -946,10 +950,6 @@ impl LogicalReplicationParser {
         &mut self,
         reader: &mut BufferReader,
     ) -> Result<LogicalReplicationMessage> {
-        if self.protocol_version >= 2 && self.is_streaming() {
-            let _xid = reader.read_u32()?;
-        }
-
         let relation_id = reader.read_u32()?;
         let key_type = reader.read_u8()? as char;
 
@@ -967,10 +967,6 @@ impl LogicalReplicationParser {
         &mut self,
         reader: &mut BufferReader,
     ) -> Result<LogicalReplicationMessage> {
-        if self.protocol_version >= 2 && self.is_streaming() {
-            let _xid = reader.read_u32()?;
-        }
-
         let relation_count = reader.read_u32()?;
         let flags = reader.read_u8()?;
 
@@ -998,10 +994,6 @@ impl LogicalReplicationParser {
         &mut self,
         reader: &mut BufferReader,
     ) -> Result<LogicalReplicationMessage> {
-        if self.protocol_version >= 2 && self.is_streaming() {
-            let _xid = reader.read_u32()?;
-        }
-
         let type_id = reader.read_u32()?;
         let namespace = reader.read_cstring()?;
         let type_name = reader.read_cstring()?;
@@ -1037,10 +1029,6 @@ impl LogicalReplicationParser {
 
     /// Parse MESSAGE (logical decoding message)
     fn parse_message(&mut self, reader: &mut BufferReader) -> Result<LogicalReplicationMessage> {
-        if self.protocol_version >= 2 && self.is_streaming() {
-            let _xid = reader.read_u32()?;
-        }
-
         let flags = reader.read_u8()?;
         let lsn = reader.read_u64()?;
         let prefix = reader.read_cstring()?;
@@ -1429,7 +1417,17 @@ pub(crate) fn message_to_change_event(
     message: StreamingReplicationMessage,
     lsn: XLogRecPtr,
 ) -> Result<Option<ChangeEvent>> {
-    let event = match message.message {
+    let xid = match message.message {
+        LogicalReplicationMessage::Relation { .. }
+        | LogicalReplicationMessage::Type { .. }
+        | LogicalReplicationMessage::Insert { .. }
+        | LogicalReplicationMessage::Update { .. }
+        | LogicalReplicationMessage::Delete { .. }
+        | LogicalReplicationMessage::Truncate { .. }
+        | LogicalReplicationMessage::Message { .. } => message.xid,
+        _ => None,
+    };
+    let mut event = match message.message {
         LogicalReplicationMessage::Relation {
             relation_id,
             namespace,
@@ -1511,6 +1509,7 @@ pub(crate) fn message_to_change_event(
                     },
                     lsn: Lsn::new(lsn),
                     metadata: None,
+                    xid: None,
                 }
             } else {
                 warn!("Received INSERT for unknown relation: {}", relation_id);
@@ -1540,6 +1539,7 @@ pub(crate) fn message_to_change_event(
                     },
                     lsn: Lsn::new(lsn),
                     metadata: None,
+                    xid: None,
                 }
             } else {
                 warn!("Received UPDATE for unknown relation: {}", relation_id);
@@ -1566,6 +1566,7 @@ pub(crate) fn message_to_change_event(
                     },
                     lsn: Lsn::new(lsn),
                     metadata: None,
+                    xid: None,
                 }
             } else {
                 warn!("Received DELETE for unknown relation: {}", relation_id);
@@ -1591,6 +1592,7 @@ pub(crate) fn message_to_change_event(
                 },
                 lsn: Lsn::new(lsn),
                 metadata: None,
+                xid: None,
             }
         }
 
@@ -1614,6 +1616,7 @@ pub(crate) fn message_to_change_event(
                 },
                 lsn: Lsn::new(lsn),
                 metadata: None,
+                xid: None,
             }
         }
 
@@ -1641,6 +1644,7 @@ pub(crate) fn message_to_change_event(
                 },
                 lsn: Lsn::new(lsn),
                 metadata: None,
+                xid: None,
             }
         }
 
@@ -1654,6 +1658,7 @@ pub(crate) fn message_to_change_event(
                 },
                 lsn: Lsn::new(lsn),
                 metadata: None,
+                xid: None,
             }
         }
 
@@ -1663,6 +1668,7 @@ pub(crate) fn message_to_change_event(
                 event_type: EventType::StreamStop,
                 lsn: Lsn::new(lsn),
                 metadata: None,
+                xid: None,
             }
         }
 
@@ -1689,6 +1695,7 @@ pub(crate) fn message_to_change_event(
                 },
                 lsn: Lsn::new(lsn),
                 metadata: None,
+                xid: None,
             }
         }
 
@@ -1714,6 +1721,7 @@ pub(crate) fn message_to_change_event(
                 },
                 lsn: Lsn::new(lsn),
                 metadata: None,
+                xid: None,
             }
         }
 
@@ -1882,6 +1890,7 @@ pub(crate) fn message_to_change_event(
         }
     };
 
+    event.xid = xid;
     Ok(Some(event))
 }
 
@@ -3482,6 +3491,123 @@ mod tests {
             }
             _ => panic!("Expected Insert"),
         }
+    }
+
+    /// The seven changes pgoutput prefixes with an xid inside a streamed chunk.
+    fn streamed_changes() -> Vec<LogicalReplicationMessage> {
+        let tuple = || TupleData::new(vec![ColumnData::text(b"1".to_vec())]);
+        vec![
+            LogicalReplicationMessage::Relation {
+                relation_id: 42,
+                namespace: Arc::from("public"),
+                relation_name: Arc::from("t"),
+                replica_identity: b'd',
+                columns: vec![ColumnInfo::new(1, "id".to_string(), 23, -1)],
+            },
+            LogicalReplicationMessage::Type {
+                type_id: 16_385,
+                namespace: "public".to_string(),
+                type_name: "mood".to_string(),
+            },
+            LogicalReplicationMessage::Insert {
+                relation_id: 42,
+                tuple: tuple(),
+            },
+            LogicalReplicationMessage::Update {
+                relation_id: 42,
+                old_tuple: Some(tuple()),
+                new_tuple: tuple(),
+                key_type: Some('K'),
+            },
+            LogicalReplicationMessage::Delete {
+                relation_id: 42,
+                old_tuple: tuple(),
+                key_type: 'K',
+            },
+            LogicalReplicationMessage::Truncate {
+                relation_ids: vec![42],
+                flags: 0,
+            },
+            LogicalReplicationMessage::Message {
+                flags: 1,
+                lsn: 0xF000,
+                prefix: "p".to_string(),
+                content: bytes::Bytes::from_static(b"c"),
+            },
+        ]
+    }
+
+    fn stream_start(xid: Xid) -> Vec<u8> {
+        let mut start = vec![message_types::STREAM_START];
+        start.extend_from_slice(&write_u32_be(xid));
+        start.push(0x01);
+        start
+    }
+
+    /// Inside a chunk each change keeps the xid written before it, which differs from the chunk's after a savepoint, and re-encodes to the same bytes.
+    #[test]
+    fn a_streamed_change_keeps_the_xid_pgoutput_wrote_before_it() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+        parser.parse_wal_message(&stream_start(745)).unwrap();
+
+        for message in streamed_changes() {
+            let sent = StreamingReplicationMessage::new_streaming(message.clone(), 746);
+            let bytes = crate::pgoutput_encode::encode_streaming_message_to_bytes(&sent, 2);
+            let parsed = parser.parse_wal_message(&bytes).unwrap();
+            assert_eq!(parsed.message, message);
+            assert_eq!(parsed.xid, Some(746), "{message:?}");
+            let reencoded = crate::pgoutput_encode::encode_streaming_message_to_bytes(&parsed, 2);
+            assert_eq!(reencoded, bytes, "{message:?}");
+        }
+    }
+
+    /// Outside a chunk no change carries an xid, `StreamStart` carries its own and `StreamStop` none.
+    #[test]
+    fn only_changes_inside_a_chunk_carry_a_change_xid() {
+        let mut parser = LogicalReplicationParser::with_protocol_version(2);
+        let started = parser.parse_wal_message(&stream_start(745)).unwrap();
+        assert_eq!(started.xid, Some(745));
+        let stopped = parser
+            .parse_wal_message(&[message_types::STREAM_STOP])
+            .unwrap();
+        assert_eq!(stopped.xid, None);
+
+        for message in streamed_changes() {
+            let sent = StreamingReplicationMessage::new(message.clone());
+            let bytes = crate::pgoutput_encode::encode_streaming_message_to_bytes(&sent, 2);
+            let parsed = parser.parse_wal_message(&bytes).unwrap();
+            assert_eq!(parsed.message, message);
+            assert_eq!(parsed.xid, None, "{message:?}");
+        }
+    }
+
+    /// Every event built from a change inside a chunk carries that change's xid, and no other event carries one.
+    #[test]
+    fn change_events_carry_the_xid_of_their_streamed_change() {
+        let mut decoder = PgOutputDecoder::with_protocol_version(2);
+        let started = decoder
+            .decode_message(stream_start(745), Lsn::new(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(started.xid, None);
+
+        for message in streamed_changes() {
+            let sent = StreamingReplicationMessage::new_streaming(message.clone(), 746);
+            let bytes = crate::pgoutput_encode::encode_streaming_message_to_bytes(&sent, 2);
+            let event = decoder.decode_message(bytes, Lsn::new(1)).unwrap();
+            let event = event.unwrap_or_else(|| panic!("no event for {message:?}"));
+            assert_eq!(event.xid, Some(746), "{message:?}");
+        }
+
+        let stopped = decoder
+            .decode_message(vec![message_types::STREAM_STOP], Lsn::new(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.xid, None);
+        let insert = StreamingReplicationMessage::new(streamed_changes().swap_remove(2));
+        let bytes = crate::pgoutput_encode::encode_streaming_message_to_bytes(&insert, 2);
+        let outside = decoder.decode_message(bytes, Lsn::new(1)).unwrap().unwrap();
+        assert_eq!(outside.xid, None);
     }
 
     #[test]

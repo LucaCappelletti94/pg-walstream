@@ -397,6 +397,7 @@ mod tests {
             },
             lsn: Lsn::new(1),
             metadata: None,
+            xid: None,
         };
         router.dispatch(&begin).await.unwrap();
         assert_eq!(hit.load(Ordering::SeqCst), 1);
@@ -471,6 +472,7 @@ mod tests {
             },
             lsn: Lsn::new(1),
             metadata: None,
+            xid: None,
         };
         router.dispatch(&begin).await.unwrap();
     }

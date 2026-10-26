@@ -739,3 +739,213 @@ async fn streamed_prepare_bytes_reencode_identically() {
         drain.reencoded_msgs, drain.data_messages
     );
 }
+
+/// Each streamed insert's `id` with the xid pgoutput wrote before it.
+fn inserts_with_xid(events: &[ChangeEvent]) -> Vec<(i64, Option<u32>)> {
+    events
+        .iter()
+        .filter_map(|e| match &e.event_type {
+            EventType::Insert { data, .. } => {
+                let id = data.get("id").and_then(|v| v.as_str())?.parse().ok()?;
+                Some((id, e.xid))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Run `statements` as one streamed transaction and drain it up to its `StreamCommit`.
+async fn stream_transaction(slot: &str, statements: &[String]) -> Vec<ChangeEvent> {
+    drop_slot(slot);
+    let mut regular =
+        PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
+    setup(&mut regular);
+
+    let mut stream = LogicalReplicationStream::new(
+        &replication_conn_string(),
+        config(slot, 2, StreamingMode::On),
+    )
+    .await
+    .expect("replication stream");
+    stream.start(None).await.expect("start replication");
+    let cancel = CancellationToken::new();
+    let deadline = cancel.clone();
+    let mut es = stream.into_stream(cancel);
+
+    for sql in statements {
+        regular.exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    spawn_cancel(&deadline, 30);
+
+    let (events, end) = drain_until(&mut es, |t| matches!(t, EventType::StreamCommit { .. })).await;
+    assert!(
+        matches!(end, DrainEnd::Terminal),
+        "drain hit its deadline after {} events without a StreamCommit",
+        events.len()
+    );
+    events
+}
+
+fn insert_rows(from: usize, to: usize) -> String {
+    format!(
+        "INSERT INTO stream_test (id, payload) \
+         SELECT g, repeat('x', 200) FROM generate_series({from}, {to}) g"
+    )
+}
+
+/// The ids left in `stream_test`, sorted.
+fn table_ids() -> Vec<i64> {
+    let mut regular =
+        PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
+    let result = regular
+        .exec("SELECT id FROM stream_test ORDER BY id")
+        .expect("select ids");
+    (0..result.ntuples())
+        .map(|row| result.get_value(row, 0).unwrap().parse().unwrap())
+        .collect()
+}
+
+/// Dropping the changes whose `xid` a subtransaction `StreamAbort` names leaves
+/// exactly the committed rows, however deeply the rolled-back savepoints nest.
+async fn assert_savepoint_rollback_is_undone_by_xid(slot: &str, statements: &[String]) -> Vec<u32> {
+    let events = stream_transaction(slot, statements).await;
+    let top = stream_starts(&events)
+        .first()
+        .copied()
+        .expect("transaction was not streamed; lower logical_decoding_work_mem");
+    let aborted: Vec<u32> = events
+        .iter()
+        .filter_map(|e| match &e.event_type {
+            EventType::StreamAbort {
+                transaction_id,
+                subtransaction_xid,
+                ..
+            } if *transaction_id == top && *subtransaction_xid != top => Some(*subtransaction_xid),
+            _ => None,
+        })
+        .collect();
+
+    let inserts = inserts_with_xid(&events);
+    assert!(
+        inserts.iter().all(|(_, xid)| xid.is_some()),
+        "a streamed insert carried no xid"
+    );
+    let mut kept: Vec<i64> = inserts
+        .iter()
+        .filter(|(_, xid)| !xid.is_some_and(|x| aborted.contains(&x)))
+        .map(|(id, _)| *id)
+        .collect();
+    kept.sort_unstable();
+    assert!(
+        kept.len() < inserts.len(),
+        "no streamed insert belonged to an aborted subtransaction"
+    );
+    assert_eq!(kept, table_ids());
+    println!(
+        "savepoint rollback: {} streamed inserts, {} kept, aborted subxids {aborted:?}",
+        inserts.len(),
+        kept.len()
+    );
+    aborted
+}
+
+/// A rolled-back savepoint's streamed rows carry its subtransaction xid, so
+/// its `StreamAbort` identifies exactly the rows to drop.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical and low logical_decoding_work_mem"]
+async fn a_rolled_back_savepoint_is_undone_by_the_xid_of_its_changes() {
+    let aborted = assert_savepoint_rollback_is_undone_by_xid(
+        "it_stream_savepoint",
+        &[
+            "BEGIN".to_string(),
+            insert_rows(1, 2000),
+            "SAVEPOINT s".to_string(),
+            insert_rows(10_001, 12_000),
+            "ROLLBACK TO SAVEPOINT s".to_string(),
+            "COMMIT".to_string(),
+        ],
+    )
+    .await;
+    assert_eq!(aborted.len(), 1, "{aborted:?}");
+}
+
+/// Rolling back to an outer savepoint aborts the nested one too, and each
+/// aborted subtransaction gets its own `StreamAbort`.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical and low logical_decoding_work_mem"]
+async fn nested_rolled_back_savepoints_are_undone_by_the_xid_of_their_changes() {
+    let aborted = assert_savepoint_rollback_is_undone_by_xid(
+        "it_stream_nested_savepoint",
+        &[
+            "BEGIN".to_string(),
+            insert_rows(1, 2000),
+            "SAVEPOINT outer_sp".to_string(),
+            insert_rows(10_001, 12_000),
+            "SAVEPOINT inner_sp".to_string(),
+            insert_rows(20_001, 22_000),
+            "ROLLBACK TO SAVEPOINT outer_sp".to_string(),
+            insert_rows(30_001, 32_000),
+            "COMMIT".to_string(),
+        ],
+    )
+    .await;
+    assert_eq!(aborted.len(), 2, "{aborted:?}");
+}
+
+/// Real-PG byte anchor for changes made inside a subtransaction, whose
+/// in-stream xid prefix differs from the streamed transaction's.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical and low logical_decoding_work_mem"]
+async fn subtransaction_stream_bytes_reencode_identically() {
+    let slot = "it_stream_subxact_raw";
+    drop_slot(slot);
+
+    let mut regular =
+        PgReplicationConnection::connect(&regular_conn_string()).expect("regular connection");
+    setup(&mut regular);
+
+    let mut repl = PgReplicationConnection::connect(&replication_conn_string())
+        .expect("replication connection");
+    repl.exec("CREATE_REPLICATION_SLOT \"it_stream_subxact_raw\" TEMPORARY LOGICAL \"pgoutput\"")
+        .expect("create temporary slot");
+
+    for sql in [
+        "BEGIN".to_string(),
+        insert_rows(1, 2000),
+        "SAVEPOINT s".to_string(),
+        insert_rows(10_001, 12_000),
+        "COMMIT".to_string(),
+    ] {
+        regular.exec(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    repl.start_replication(
+        slot,
+        0,
+        &[
+            ("proto_version", "2"),
+            ("publication_names", "\"stream_pub\""),
+            ("streaming", "on"),
+        ],
+    )
+    .expect("start replication");
+
+    let cancel = CancellationToken::new();
+    spawn_cancel(&cancel, 30);
+
+    let drain = drain_reencode(&mut repl, 2, &cancel, |m| {
+        matches!(m, LogicalReplicationMessage::StreamCommit { .. })
+    })
+    .await;
+
+    assert!(
+        matches!(drain.end, DrainEnd::Terminal),
+        "drain hit its deadline after {} re-encoded message(s) without a StreamCommit",
+        drain.reencoded_msgs
+    );
+    assert!(drain.saw_stream_start, "expected a StreamStart");
+    assert!(
+        drain.data_messages >= 1,
+        "expected at least one re-encoded in-stream data message"
+    );
+}

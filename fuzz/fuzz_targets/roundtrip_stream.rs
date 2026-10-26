@@ -3,9 +3,9 @@
 //!
 //! Opens a StreamStart so the parser enters streaming context, then feeds an
 //! arbitrary run of generated data messages, each encoded with
-//! `encode_streaming_message` (which emits the in-stream xid prefix). Every
-//! message must parse mid-stream back to itself and re-encode byte-for-byte.
-//! This exercises the streaming-context path the single-message round-trips miss.
+//! `encode_streaming_message` under its own xid, as subtransactions write them.
+//! Every message must parse mid-stream back to itself with that xid and
+//! re-encode byte-for-byte.
 
 use arbitrary::Unstructured;
 use bytes::BytesMut;
@@ -51,11 +51,14 @@ fuzz_target!(|data: &[u8]| {
         let Ok(message) = arbitrary_logical_replication_message(&mut u) else {
             break;
         };
+        let Ok(change_xid) = u.arbitrary::<u32>() else {
+            break;
+        };
         if !is_streamable_data(&message) || !parser_producible(&message) {
             continue;
         }
 
-        let wrapper = StreamingReplicationMessage::new_streaming(message.clone(), xid);
+        let wrapper = StreamingReplicationMessage::new_streaming(message.clone(), change_xid);
         let mut bytes = BytesMut::new();
         encode_streaming_message(&wrapper, version, &mut bytes);
 
@@ -63,7 +66,7 @@ fuzz_target!(|data: &[u8]| {
             .parse_wal_message(&bytes)
             .expect("streamed data message must parse mid-stream");
         assert_eq!(parsed.message, message, "value round-trip mismatch");
-        assert_eq!(parsed.xid, Some(xid), "in-stream xid mismatch");
+        assert_eq!(parsed.xid, Some(change_xid), "in-stream xid mismatch");
 
         let mut reencoded = BytesMut::new();
         encode_streaming_message(&parsed, version, &mut reencoded);

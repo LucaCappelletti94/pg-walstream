@@ -643,7 +643,12 @@ pub enum EventType {
         end_lsn: Lsn,
         commit_timestamp: chrono::DateTime<chrono::Utc>,
     },
-    /// Streaming transaction abort
+    /// Streaming transaction abort.
+    ///
+    /// With `subtransaction_xid == transaction_id` the whole streamed transaction
+    /// is rolled back. Otherwise only that subtransaction is, and its changes
+    /// are the ones whose [`ChangeEvent::xid`] equals `subtransaction_xid`. Rolling
+    /// back nested savepoints sends one `StreamAbort` per subtransaction.
     StreamAbort {
         transaction_id: u32,
         subtransaction_xid: u32,
@@ -792,6 +797,16 @@ pub struct ChangeEvent {
 
     /// Additional user-defined metadata (key-value string pairs).
     pub metadata: Option<BTreeMap<String, String>>,
+
+    /// The xid pgoutput wrote before this change inside a streamed chunk.
+    ///
+    /// It is the subtransaction's xid for a change made after a savepoint, and
+    /// the top-level transaction's otherwise. A `StreamAbort` whose
+    /// `subtransaction_xid` differs from its `transaction_id` rolls back the
+    /// changes with that `xid`. `None` outside a streamed chunk and for events
+    /// that are not changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xid: Option<u32>,
 }
 
 impl ChangeEvent {
@@ -840,6 +855,7 @@ impl ChangeEvent {
             },
             lsn,
             metadata: None,
+            xid: None,
         }
     }
 
@@ -906,6 +922,7 @@ impl ChangeEvent {
             },
             lsn,
             metadata: None,
+            xid: None,
         }
     }
 
@@ -962,6 +979,7 @@ impl ChangeEvent {
             },
             lsn,
             metadata: None,
+            xid: None,
         }
     }
 
@@ -989,6 +1007,7 @@ impl ChangeEvent {
             },
             lsn,
             metadata: None,
+            xid: None,
         }
     }
 
@@ -1014,6 +1033,7 @@ impl ChangeEvent {
             },
             lsn,
             metadata: None,
+            xid: None,
         }
     }
 
@@ -1039,6 +1059,7 @@ impl ChangeEvent {
             },
             lsn,
             metadata: None,
+            xid: None,
         }
     }
 
@@ -1070,6 +1091,7 @@ impl ChangeEvent {
             },
             lsn,
             metadata: None,
+            xid: None,
         }
     }
 
@@ -1095,6 +1117,7 @@ impl ChangeEvent {
             },
             lsn,
             metadata: None,
+            xid: None,
         }
     }
 
@@ -1113,6 +1136,7 @@ impl ChangeEvent {
             },
             lsn,
             metadata: None,
+            xid: None,
         }
     }
 
@@ -1141,6 +1165,7 @@ impl ChangeEvent {
             },
             lsn,
             metadata: None,
+            xid: None,
         }
     }
 
@@ -1163,6 +1188,7 @@ impl ChangeEvent {
             },
             lsn,
             metadata: None,
+            xid: None,
         }
     }
 
@@ -1187,6 +1213,7 @@ impl ChangeEvent {
             },
             lsn,
             metadata: None,
+            xid: None,
         }
     }
 
@@ -1211,6 +1238,7 @@ impl ChangeEvent {
             },
             lsn,
             metadata: None,
+            xid: None,
         }
     }
 
@@ -1238,6 +1266,7 @@ impl ChangeEvent {
             },
             lsn,
             metadata: None,
+            xid: None,
         }
     }
 
@@ -1262,6 +1291,7 @@ impl ChangeEvent {
             },
             lsn,
             metadata: None,
+            xid: None,
         }
     }
 
@@ -2852,6 +2882,7 @@ mod tests {
             },
             lsn: Lsn::new(1),
             metadata: None,
+            xid: None,
         };
         assert_eq!(stream_start.event_type_str(), "stream_start");
 
@@ -2859,6 +2890,7 @@ mod tests {
             event_type: EventType::StreamStop,
             lsn: Lsn::new(2),
             metadata: None,
+            xid: None,
         };
         assert_eq!(stream_stop.event_type_str(), "stream_stop");
 
@@ -2872,6 +2904,7 @@ mod tests {
             },
             lsn: Lsn::new(3),
             metadata: None,
+            xid: None,
         };
         assert_eq!(stream_commit.event_type_str(), "stream_commit");
 
@@ -2884,6 +2917,7 @@ mod tests {
             },
             lsn: Lsn::new(4),
             metadata: None,
+            xid: None,
         };
         assert_eq!(stream_abort.event_type_str(), "stream_abort");
     }
