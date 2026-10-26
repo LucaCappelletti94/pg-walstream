@@ -193,6 +193,10 @@ path = "integration-tests/upload_manifest.rs"
 name = "require_existing_slot"
 path = "integration-tests/require_existing_slot.rs"
 
+[[test]]
+name = "startup_metadata"
+path = "integration-tests/startup_metadata.rs"
+
 [[bench]]
 name = "wal_pipeline"
 harness = false
