@@ -252,6 +252,8 @@ pub struct PgReplicationConnection {
     copy: CopyMode,
     /// Set by [`PgReplicationConnection::mark_dead`]. Cleared by `start_replication`.
     dead: bool,
+    /// Raised while an async command awaits its reply. A dropped future leaves it raised, and the connection then reports dead.
+    in_flight: bool,
 }
 
 /// A half-open connection from `connect_async`; dropping it runs `PQfinish`,
@@ -437,6 +439,7 @@ impl PgReplicationConnection {
             copy: CopyMode::Idle,
             read_buf: BytesMut::with_capacity(READ_BUF_INITIAL_CAPACITY),
             dead: false,
+            in_flight: false,
         })
     }
 
@@ -536,6 +539,7 @@ impl PgReplicationConnection {
             copy: CopyMode::Idle,
             read_buf: BytesMut::with_capacity(READ_BUF_INITIAL_CAPACITY),
             dead: false,
+            in_flight: false,
         })
     }
 
@@ -647,6 +651,7 @@ impl PgReplicationConnection {
 
     /// Execute a replication command (like IDENTIFY_SYSTEM)
     pub fn exec(&mut self, query: &str) -> Result<PgResult> {
+        self.reject_in_flight()?;
         let c_query = CString::new(query)
             .map_err(|e| ReplicationError::protocol(format!("Invalid query string: {e}")))?;
 
@@ -659,7 +664,126 @@ impl PgReplicationConnection {
         }
 
         let pg_result = PgResult::new(result);
-        // Check for errors
+        Self::check_exec_status(query, &pg_result)?;
+        Ok(pg_result)
+    }
+
+    /// The async sibling of [`exec`](Self::exec), driven by `PQsendQuery` and
+    /// `AsyncFd` socket readiness instead of a blocking `PQexec`.
+    pub async fn exec_async(&mut self, query: &str) -> Result<PgResult> {
+        self.reject_in_flight()?;
+        let c_query = CString::new(query)
+            .map_err(|e| ReplicationError::protocol(format!("Invalid query string: {e}")))?;
+        self.initialize_async_socket()?;
+
+        // Raised before the first await and lowered on every exit path; a dropped
+        // future is the only way it stays raised.
+        self.in_flight = true;
+        let result = self.exec_in_flight(&c_query, query).await;
+        self.in_flight = false;
+        result
+    }
+
+    /// The `PQsendQuery`/`PQgetResult` exchange behind `exec_async`, in non-blocking mode.
+    async fn exec_in_flight(&mut self, c_query: &CString, query: &str) -> Result<PgResult> {
+        if unsafe { PQsendQuery(self.conn, c_query.as_ptr()) } == 0 {
+            let error_msg = self.last_error_message();
+            return Err(ReplicationError::protocol(format!(
+                "Failed to send query: {error_msg}"
+            )));
+        }
+
+        self.flush_until_done().await?;
+
+        // `PQexec` returns a single result; keep the last one and stop early at a
+        // COPY status, where the data transfer takes over.
+        let mut last: Option<PgResult> = None;
+        loop {
+            if unsafe { PQisBusy(self.conn) } == 0 {
+                let raw = unsafe { PQgetResult(self.conn) };
+                if raw.is_null() {
+                    break;
+                }
+                let pg_result = PgResult::new(raw);
+                let status = pg_result.status();
+                last = Some(pg_result);
+                if matches!(
+                    status,
+                    ExecStatusType::PGRES_COPY_IN
+                        | ExecStatusType::PGRES_COPY_OUT
+                        | ExecStatusType::PGRES_COPY_BOTH
+                ) || unsafe { PQstatus(self.conn) } == ConnStatusType::CONNECTION_BAD
+                {
+                    break;
+                }
+            } else {
+                self.await_readable().await?;
+            }
+        }
+
+        match last {
+            Some(pg_result) => {
+                Self::check_exec_status(query, &pg_result)?;
+                Ok(pg_result)
+            }
+            None => Err(ReplicationError::protocol(
+                "Query execution failed - null result".to_string(),
+            )),
+        }
+    }
+
+    /// Wait for a readable edge on libpq's socket and pull the pending data into its buffer.
+    async fn await_readable(&mut self) -> Result<()> {
+        let async_fd = self
+            .async_fd
+            .as_ref()
+            .ok_or_else(|| ReplicationError::protocol("AsyncFd not initialized".to_string()))?;
+        let mut guard = async_fd.readable().await.map_err(|e| {
+            ReplicationError::protocol(format!("Failed to wait for socket readability: {e}"))
+        })?;
+        if unsafe { PQconsumeInput(self.conn) } == 0 {
+            let error_msg = self.last_error_message();
+            return Err(ReplicationError::transient_connection(format!(
+                "PQconsumeInput failed: {error_msg}"
+            )));
+        }
+        // libpq can stop reading before the kernel buffer is empty, and no new edge arrives for bytes already queued, so readiness is cleared only when a peek would block.
+        let _ = guard.try_io(|fd| {
+            socket2::SockRef::from(fd.get_ref())
+                .peek(&mut [std::mem::MaybeUninit::uninit()])
+                .map(drop)
+        });
+        Ok(())
+    }
+
+    /// Flush libpq's output buffer to the socket, waiting on the socket for the space.
+    async fn flush_until_done(&mut self) -> Result<()> {
+        loop {
+            match unsafe { PQflush(self.conn) } {
+                0 => return Ok(()),
+                1 => {
+                    let async_fd = self.async_fd.as_ref().ok_or_else(|| {
+                        ReplicationError::protocol("AsyncFd not initialized".to_string())
+                    })?;
+                    let mut guard = async_fd.writable().await.map_err(|e| {
+                        ReplicationError::protocol(format!(
+                            "Failed to wait for socket writability: {e}"
+                        ))
+                    })?;
+                    guard.clear_ready();
+                }
+                _ => {
+                    let error_msg = self.last_error_message();
+                    return Err(ReplicationError::protocol(format!(
+                        "Failed to flush connection: {error_msg}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Classify a freshly collected `PGresult` the way `exec` does.
+    fn check_exec_status(query: &str, pg_result: &PgResult) -> Result<()> {
         let status = pg_result.status();
         info!(
             "query : {} pg_result.status() : {:?}",
@@ -681,29 +805,47 @@ impl PgReplicationConnection {
                 format!("Query execution failed: {error_msg}"),
             ));
         }
+        Ok(())
+    }
 
-        Ok(pg_result)
+    /// Reject a command while a cancelled async command's query is still queued in libpq.
+    fn reject_in_flight(&self) -> Result<()> {
+        if self.in_flight {
+            return Err(ReplicationError::protocol(
+                "cannot issue a command while a previously cancelled async command is in flight"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Send IDENTIFY_SYSTEM command
     pub fn identify_system(&mut self) -> Result<PgResult> {
         debug!("Sending IDENTIFY_SYSTEM command");
         let result = self.exec("IDENTIFY_SYSTEM")?;
-
-        if result.ntuples() > 0 {
-            if let (Some(systemid), Some(timeline), Some(xlogpos)) = (
-                result.get_value(0, 0),
-                result.get_value(0, 1),
-                result.get_value(0, 2),
-            ) {
-                debug!(
-                    "System identification: systemid={}, timeline={}, xlogpos={}",
-                    systemid, timeline, xlogpos
-                );
-            }
-        }
-
+        Self::log_identity(&result);
         Ok(result)
+    }
+
+    /// Non-blocking [`identify_system`](Self::identify_system).
+    pub async fn identify_system_async(&mut self) -> Result<PgResult> {
+        debug!("Sending IDENTIFY_SYSTEM command");
+        let result = self.exec_async("IDENTIFY_SYSTEM").await?;
+        Self::log_identity(&result);
+        Ok(result)
+    }
+
+    fn log_identity(result: &PgResult) {
+        if let (Some(systemid), Some(timeline), Some(xlogpos)) = (
+            result.get_value(0, 0),
+            result.get_value(0, 1),
+            result.get_value(0, 2),
+        ) {
+            debug!(
+                "System identification: systemid={}, timeline={}, xlogpos={}",
+                systemid, timeline, xlogpos
+            );
+        }
     }
 
     /// Start logical replication
@@ -714,18 +856,36 @@ impl PgReplicationConnection {
         options: &[(&str, &str)],
     ) -> Result<()> {
         let sql = crate::sql_builder::build_start_replication_sql(slot_name, start_lsn, options)?;
-
         debug!("Starting replication: {}", sql);
-        let _result = self.exec(&sql)?;
+        self.exec(&sql)?;
+        self.enter_replication()?;
+        debug!("Replication started successfully");
+        Ok(())
+    }
 
+    /// Non-blocking [`start_replication`](Self::start_replication).
+    pub async fn start_replication_async(
+        &mut self,
+        slot_name: &str,
+        start_lsn: XLogRecPtr,
+        options: &[(&str, &str)],
+    ) -> Result<()> {
+        let sql = crate::sql_builder::build_start_replication_sql(slot_name, start_lsn, options)?;
+        debug!("Starting replication: {}", sql);
+        self.exec_async(&sql).await?;
+        self.enter_replication()?;
+        debug!("Replication started successfully");
+        Ok(())
+    }
+
+    /// Record a freshly entered CopyBoth stream.
+    fn enter_replication(&mut self) -> Result<()> {
         // A fresh COPY stream: drop any terminal state left by a previous one.
         self.dead = false;
 
         // Initialize the async socket first; enter `CopyMode::Replication` only AFTER it succeeds, preserving the invariant `copy.is_replication() ⇒ async_fd is Some`. Otherwise a failed socket setup would leave the mode set with no async_fd, and a later `end_copy`/Drop would reach the writable-wait path with `async_fd == None`.
         self.initialize_async_socket()?;
         self.copy = CopyMode::Replication(CopyStream::default());
-
-        debug!("Replication started successfully");
         Ok(())
     }
 
@@ -1256,31 +1416,8 @@ impl PgReplicationConnection {
             )));
         }
 
-        // Flush loop: PQflush returns 0 on success, 1 if data remains (wait for writable), -1 on error.  We use async_fd.writable() so the executor thread is released while waiting for the OS socket to become writable.
-        loop {
-            let flush_result = unsafe { PQflush(self.conn) };
-            match flush_result {
-                0 => return Ok(()),
-                1 => {
-                    // Data still pending – wait for the socket to become writable.
-                    let async_fd = self.async_fd.as_ref().ok_or_else(|| {
-                        ReplicationError::protocol("AsyncFd not initialized".to_string())
-                    })?;
-                    let mut guard = async_fd.writable().await.map_err(|e| {
-                        ReplicationError::protocol(format!(
-                            "Failed to wait for socket writability: {e}"
-                        ))
-                    })?;
-                    guard.clear_ready();
-                }
-                _ => {
-                    let error_msg = self.last_error_message();
-                    return Err(ReplicationError::protocol(format!(
-                        "Failed to flush connection: {error_msg}"
-                    )));
-                }
-            }
-        }
+        self.flush_until_done().await?;
+        Ok(())
     }
 
     /// Send a client CopyDone (`PQputCopyEnd`) to end the COPY stream cleanly.
@@ -1356,7 +1493,7 @@ impl PgReplicationConnection {
 
     /// Check if the connection is still alive
     pub(crate) fn is_alive(&self) -> bool {
-        if self.conn.is_null() || self.dead {
+        if self.conn.is_null() || self.dead || self.in_flight {
             return false;
         }
 
@@ -1427,6 +1564,29 @@ impl PgReplicationConnection {
         output_plugin: Option<&str>,
         options: &ReplicationSlotOptions,
     ) -> Result<PgResult> {
+        let sql = self.create_slot_sql(slot_name, slot_type, output_plugin, options)?;
+        self.exec(&sql)
+    }
+
+    /// Non-blocking [`create_replication_slot_with_options`](Self::create_replication_slot_with_options).
+    pub async fn create_replication_slot_with_options_async(
+        &mut self,
+        slot_name: &str,
+        slot_type: SlotType,
+        output_plugin: Option<&str>,
+        options: &ReplicationSlotOptions,
+    ) -> Result<PgResult> {
+        let sql = self.create_slot_sql(slot_name, slot_type, output_plugin, options)?;
+        self.exec_async(&sql).await
+    }
+
+    fn create_slot_sql(
+        &self,
+        slot_name: &str,
+        slot_type: SlotType,
+        output_plugin: Option<&str>,
+        options: &ReplicationSlotOptions,
+    ) -> Result<String> {
         let sql = crate::sql_builder::prepare_create_slot(
             self.server_version(),
             slot_name,
@@ -1435,7 +1595,7 @@ impl PgReplicationConnection {
             options,
         )?;
         debug!("Creating replication slot: {}", sql);
-        self.exec(&sql)
+        Ok(sql)
     }
 
     /// Alter a replication slot (logical slots only)
@@ -1467,10 +1627,25 @@ impl PgReplicationConnection {
     /// * `slot_name` - Name of the replication slot to drop
     /// * `wait` - If true, the command waits until the slot becomes inactive instead of returning an error when the slot is in use
     pub fn drop_replication_slot(&mut self, slot_name: &str, wait: bool) -> Result<()> {
-        let sql = crate::sql_builder::build_drop_slot_sql(slot_name, wait)?;
-
-        debug!("Dropping replication slot: {}", sql);
+        let sql = Self::drop_slot_sql(slot_name, wait)?;
         let result = self.exec(&sql)?;
+        Self::slot_dropped(slot_name, &result)
+    }
+
+    /// Non-blocking [`drop_replication_slot`](Self::drop_replication_slot).
+    pub async fn drop_replication_slot_async(&mut self, slot_name: &str, wait: bool) -> Result<()> {
+        let sql = Self::drop_slot_sql(slot_name, wait)?;
+        let result = self.exec_async(&sql).await?;
+        Self::slot_dropped(slot_name, &result)
+    }
+
+    fn drop_slot_sql(slot_name: &str, wait: bool) -> Result<String> {
+        let sql = crate::sql_builder::build_drop_slot_sql(slot_name, wait)?;
+        debug!("Dropping replication slot: {}", sql);
+        Ok(sql)
+    }
+
+    fn slot_dropped(slot_name: &str, result: &PgResult) -> Result<()> {
         if !result.is_ok() {
             return Err(ReplicationError::replication_slot(format!(
                 "Failed to drop replication slot '{}': {}",
@@ -1762,6 +1937,7 @@ impl PgReplicationConnection {
             copy: CopyMode::Idle,
             read_buf: BytesMut::new(),
             dead: false,
+            in_flight: false,
         }
     }
 
@@ -1903,7 +2079,7 @@ impl Drop for PgResult {
     }
 }
 
-// # Safety: `PgResult` wraps `*mut PGresult`.  It is only created and consumed within synchronous code paths (no `.await` while a `PgResult` is live), but the compiler may conservatively include it in generator state.  `Send` is sufficient because the result is never shared — it is always owned by a single task.
+// # Safety: `PgResult` wraps `*mut PGresult`. Async commands hold a result across awaits, so one lives in the future's generator state, but each result is owned by a single task and never shared.
 unsafe impl Send for PgResult {}
 
 // ── Free functions for the drain-loop optimization ────────────────────────
@@ -2988,6 +3164,28 @@ mod tests {
         );
         let err = result.err().expect("expected error");
         assert!(err.to_string().contains("null bytes"));
+    }
+
+    // === `in_flight` cancellation guard ===
+
+    /// A dropped `exec_async` leaves `in_flight` set; the connection must then
+    /// report dead and refuse further commands, because libpq still queues the
+    /// cancelled query's reply for the next one.
+    #[test]
+    fn in_flight_latch_marks_dead_and_rejects_commands() {
+        let mut conn = PgReplicationConnection::null_for_testing();
+        conn.in_flight = true;
+
+        assert!(
+            !conn.is_alive(),
+            "a cancelled in-flight command must read as dead"
+        );
+        let err = conn.exec("IDENTIFY_SYSTEM").err().expect("expected error");
+        assert!(format!("{err}").contains("in flight"), "{err}");
+        let err = block_on(conn.exec_async("IDENTIFY_SYSTEM"))
+            .err()
+            .expect("expected error");
+        assert!(format!("{err}").contains("in flight"), "{err}");
     }
 
     /// `PQconnectPoll` never enforces `connect_timeout`, so `connect_async` must
