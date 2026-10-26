@@ -5,6 +5,10 @@ codecov:
 comment:
   after_n_builds: 2
 
+# The integration report also instruments the suites' own sources.
+ignore:
+  - "integration-tests"
+
 coverage:
   status:
     project:
