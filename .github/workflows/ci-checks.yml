@@ -382,7 +382,7 @@ jobs:
             # Exercise the opt-in derive-macro layer.
             typed_deserialization|ergonomics) variants=("--features derive") ;;
             # libpq-only API surface.
-            pg_result_get_bytes|libpq_async_connect) variants=("--no-default-features --features libpq") ;;
+            pg_result_get_bytes|libpq_async_connect|libpq_async_commands) variants=("--no-default-features --features libpq") ;;
             # Server diagnostics and COPY framing are parsed independently by each
             # backend, so these must prove out on both. `initial_snapshot` and
             # `aligned_snapshot` join them: their COPY-out reader is a hand-rolled
