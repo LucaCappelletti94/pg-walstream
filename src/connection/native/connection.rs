@@ -5,6 +5,7 @@
 
 use bytes::{Bytes, BytesMut};
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
@@ -35,14 +36,14 @@ enum Command {
     /// status and `is_ok`, so this stays a thin I/O primitive.
     Query {
         sql: String,
-        reply: std_mpsc::Sender<Result<NativePgResult>>,
+        reply: Reply<Result<NativePgResult>>,
     },
     /// Run a simple query that answers with `CopyInResponse`, streaming
     /// `payload` into it. Only `UPLOAD_MANIFEST` uses this.
     QueryCopyIn {
         sql: String,
         payload: Bytes,
-        reply: std_mpsc::Sender<Result<NativePgResult>>,
+        reply: Reply<Result<NativePgResult>>,
     },
     /// Enter the streaming push loop: the worker continuously reads CopyData
     /// batches and pushes them down `batch_tx` until the token is cancelled, the
@@ -81,6 +82,47 @@ enum Command {
 /// batches is enough to let the worker's next read overlap the consumer's parse.
 const BATCH_CHANNEL_CAP: usize = 16;
 
+/// Where the worker delivers a command's outcome.
+///
+/// A sync caller blocks on `std::sync::mpsc`, which is legal inside any runtime context. An async caller awaits a `oneshot` whose closing tells the worker the caller gave up.
+enum Reply<T> {
+    Blocking(std_mpsc::Sender<T>),
+    Async(oneshot::Sender<T>),
+}
+
+impl<T> Reply<T> {
+    fn send(self, value: T) {
+        match self {
+            Self::Blocking(tx) => {
+                let _ = tx.send(value);
+            }
+            Self::Async(tx) => {
+                let _ = tx.send(value);
+            }
+        }
+    }
+
+    /// Resolves once an async caller drops its receiver. A blocked sync caller cannot give up.
+    async fn closed(&mut self) {
+        match self {
+            Self::Blocking(_) => std::future::pending().await,
+            Self::Async(tx) => tx.closed().await,
+        }
+    }
+
+    /// Runs `job` and delivers its outcome, or drops `job` mid-flight once the caller has given up.
+    async fn answer(mut self, job: impl Future<Output = T>) {
+        let outcome = tokio::select! {
+            biased;
+            () = self.closed() => None,
+            value = job => Some(value),
+        };
+        if let Some(value) = outcome {
+            self.send(value);
+        }
+    }
+}
+
 /// Fail a command that cannot legally run while a COPY OUT is in flight.
 ///
 /// Mirrors what the `StreamCopy` / `CopyOutStream` arms of [`Worker::handle_stream_cmd`] already do for their own illegal cases: answer the caller rather than touching the pinned transport.
@@ -95,7 +137,7 @@ fn reject_during_copy_out(cmd: Command) {
     };
     match cmd {
         Command::Query { reply, .. } | Command::QueryCopyIn { reply, .. } => {
-            let _ = reply.send(Err(err()));
+            reply.send(Err(err()));
         }
         Command::PutCopyData { reply, .. } => {
             let _ = reply.send(Err(err()));
@@ -362,7 +404,7 @@ impl Worker {
                 StreamCmd::Continue
             }
             Some(Command::Query { sql, reply }) => {
-                let _ = reply.send(self.query(&sql).await);
+                reply.answer(self.query(&sql)).await;
                 StreamCmd::Continue
             }
             Some(Command::QueryCopyIn {
@@ -370,7 +412,7 @@ impl Worker {
                 payload,
                 reply,
             }) => {
-                let _ = reply.send(self.query_copy_in(&sql, &payload).await);
+                reply.answer(self.query_copy_in(&sql, &payload)).await;
                 StreamCmd::Continue
             }
             Some(Command::Close {
@@ -473,18 +515,20 @@ impl WorkerInit {
 
 /// Build the transport and report the outcome back to the connecting thread.
 ///
-/// Consumes `ready_tx`, which is dropped when this returns (on either path), so the worker command loop never has to thread it through or drop it by hand.
-async fn build_and_report(
-    init: WorkerInit,
-    ready_tx: std_mpsc::Sender<Result<i32>>,
-) -> Option<Worker> {
-    match init.build().await {
+/// Abandons the handshake as soon as an async caller stops waiting, so a cancelled `connect_async` releases its socket and thread promptly.
+async fn build_and_report(init: WorkerInit, mut ready: Reply<Result<i32>>) -> Option<Worker> {
+    let built = tokio::select! {
+        biased;
+        () = ready.closed() => return None,
+        built = init.build() => built,
+    };
+    match built {
         Ok(worker) => {
-            let _ = ready_tx.send(Ok(worker.server_ver));
+            ready.send(Ok(worker.server_ver));
             Some(worker)
         }
         Err(e) => {
-            let _ = ready_tx.send(Err(e));
+            ready.send(Err(e));
             None
         }
     }
@@ -493,12 +537,12 @@ async fn build_and_report(
 /// Entry point for the dedicated worker thread.
 ///
 /// Builds a current-thread runtime, establishes the transport, reports the
-/// outcome over `ready_tx`, then serves commands until `Close` or until the
+/// outcome over `ready`, then serves commands until `Close` or until the
 /// command channel closes.
 fn run_worker(
     init: WorkerInit,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
-    ready_tx: std_mpsc::Sender<Result<i32>>,
+    ready: Reply<Result<i32>>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -506,7 +550,7 @@ fn run_worker(
     {
         Ok(rt) => rt,
         Err(e) => {
-            let _ = ready_tx.send(Err(ReplicationError::backend(format!(
+            ready.send(Err(ReplicationError::backend(format!(
                 "failed to build worker runtime: {e}"
             ))));
             return;
@@ -514,21 +558,21 @@ fn run_worker(
     };
 
     rt.block_on(async move {
-        let Some(mut worker) = build_and_report(init, ready_tx).await else {
+        let Some(mut worker) = build_and_report(init, ready).await else {
             return;
         };
 
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 Command::Query { sql, reply } => {
-                    let _ = reply.send(worker.query(&sql).await);
+                    reply.answer(worker.query(&sql)).await;
                 }
                 Command::QueryCopyIn {
                     sql,
                     payload,
                     reply,
                 } => {
-                    let _ = reply.send(worker.query_copy_in(&sql, &payload).await);
+                    reply.answer(worker.query_copy_in(&sql, &payload)).await;
                 }
                 Command::StreamCopy { token, batch_tx } => {
                     // Runs its own loop, servicing interleaved commands, until
@@ -566,7 +610,7 @@ fn run_worker(
 /// `handle` is the multi-thread runtime the connection's socket was created on (captured at `connect`). We always drive the future on *that* runtime so the socket stays registered on its original reactor — regardless of the caller's context. This matters most on `Drop`: a connection can be dropped after the ambient runtime context is gone (e.g. moved out of the `block_on` scope it was created in), and resolving the runtime via `Handle::try_current()` at that point would build a throwaway runtime whose reactor never owned the socket, orphaning it and risking a silent hang.
 fn run_sync<F>(handle: &tokio::runtime::Handle, fut: F) -> F::Output
 where
-    F: std::future::Future + Send,
+    F: Future + Send,
     F::Output: Send,
 {
     match tokio::runtime::Handle::try_current() {
@@ -626,6 +670,8 @@ pub struct NativeConnection {
     copy: CopyMode,
     /// Liveness flag shared with the worker, which clears it on a transient read error.
     alive: Arc<AtomicBool>,
+    /// Set while an async command awaits its reply. Still set afterwards only when that future was dropped mid-reply.
+    command_in_flight: bool,
 }
 
 /// Which COPY sub-protocol the transport is inside, and that mode's state.
@@ -691,6 +737,35 @@ impl NativeConnection {
         }
     }
 
+    /// Non-blocking [`connect`](Self::connect): the handshake never parks the calling thread, and dropping the future abandons it.
+    ///
+    /// Picks the driver by the ambient runtime flavor exactly as `connect` does.
+    pub async fn connect_async(conninfo: &str) -> Result<Self> {
+        if Self::prefer_inline_driver() {
+            let alive = Arc::new(AtomicBool::new(false));
+            let worker = WorkerInit::Connect {
+                conninfo: conninfo.to_string(),
+                alive: alive.clone(),
+            }
+            .build()
+            .await?;
+            Ok(Self::inline(
+                worker,
+                tokio::runtime::Handle::current(),
+                alive,
+            ))
+        } else {
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let (cmd_tx, worker, alive) = Self::spawn_worker(conninfo, Reply::Async(ready_tx))?;
+            // The worker is never joined here: a failed handshake ends its thread on its own, and joining would block the executor.
+            match ready_rx.await {
+                Ok(Ok(server_ver)) => Ok(Self::threaded(cmd_tx, worker, server_ver, alive)),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(Self::worker_exited_before_connecting()),
+            }
+        }
+    }
+
     /// The inline driver is chosen *only* under a persistent multi-thread ambient
     /// runtime, where `run_sync` (`block_in_place` + `Handle::block_on`) reuses
     /// that runtime's reactor across calls — so the connection's socket stays
@@ -719,13 +794,17 @@ impl NativeConnection {
             }
             .build(),
         )?;
+        Ok(Self::inline(worker, handle, alive))
+    }
+
+    fn inline(worker: Worker, handle: tokio::runtime::Handle, alive: Arc<AtomicBool>) -> Self {
         alive.store(true, Ordering::Relaxed);
         let server_ver = worker.server_ver;
         debug!(
             "Connected to PostgreSQL {} via native rustls (inline)",
             server_ver
         );
-        Ok(Self {
+        Self {
             driver: Driver::Inline {
                 worker,
                 pending: VecDeque::with_capacity(256),
@@ -734,17 +813,39 @@ impl NativeConnection {
             server_ver,
             copy: CopyMode::Idle,
             alive,
-        })
+            command_in_flight: false,
+        }
     }
 
     /// Threaded driver: spawn the worker thread, which establishes the TCP connection (optionally upgraded to TLS via rustls) and performs the v3.0 startup handshake and authentication on its own runtime. Blocks until the worker reports success or failure.
     fn connect_threaded(conninfo: &str) -> Result<Self> {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std_mpsc::channel();
+        let (cmd_tx, worker, alive) = Self::spawn_worker(conninfo, Reply::Blocking(ready_tx))?;
+        match ready_rx.recv() {
+            Ok(Ok(server_ver)) => Ok(Self::threaded(cmd_tx, worker, server_ver, alive)),
+            Ok(Err(e)) => {
+                let _ = worker.join();
+                Err(e)
+            }
+            Err(_) => {
+                let _ = worker.join();
+                Err(Self::worker_exited_before_connecting())
+            }
+        }
+    }
+
+    fn spawn_worker(
+        conninfo: &str,
+        ready: Reply<Result<i32>>,
+    ) -> Result<(
+        mpsc::UnboundedSender<Command>,
+        std::thread::JoinHandle<()>,
+        Arc<AtomicBool>,
+    )> {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let alive = Arc::new(AtomicBool::new(false));
         let worker_alive = alive.clone();
         let conninfo = conninfo.to_string();
-
         let worker = std::thread::Builder::new()
             .name("pg-walstream-native".to_string())
             .spawn(move || {
@@ -754,40 +855,40 @@ impl NativeConnection {
                         alive: worker_alive,
                     },
                     cmd_rx,
-                    ready_tx,
+                    ready,
                 )
             })
             .map_err(|e| {
                 ReplicationError::backend(format!("failed to spawn native worker thread: {e}"))
             })?;
+        Ok((cmd_tx, worker, alive))
+    }
 
-        match ready_rx.recv() {
-            Ok(Ok(server_ver)) => {
-                alive.store(true, Ordering::Relaxed);
-                debug!("Connected to PostgreSQL {} via native rustls", server_ver);
-                Ok(Self {
-                    driver: Driver::Threaded {
-                        cmd_tx,
-                        worker: Some(worker),
-                        pending: VecDeque::with_capacity(256),
-                        batch_rx: None,
-                    },
-                    server_ver,
-                    copy: CopyMode::Idle,
-                    alive,
-                })
-            }
-            Ok(Err(e)) => {
-                let _ = worker.join();
-                Err(e)
-            }
-            Err(_) => {
-                let _ = worker.join();
-                Err(ReplicationError::backend(
-                    "native worker thread exited before connecting",
-                ))
-            }
+    fn threaded(
+        cmd_tx: mpsc::UnboundedSender<Command>,
+        worker: std::thread::JoinHandle<()>,
+        server_ver: i32,
+        alive: Arc<AtomicBool>,
+    ) -> Self {
+        alive.store(true, Ordering::Relaxed);
+        debug!("Connected to PostgreSQL {} via native rustls", server_ver);
+        Self {
+            driver: Driver::Threaded {
+                cmd_tx,
+                worker: Some(worker),
+                pending: VecDeque::with_capacity(256),
+                batch_rx: None,
+            },
+            server_ver,
+            copy: CopyMode::Idle,
+            alive,
+            command_in_flight: false,
         }
+    }
+
+    #[cold]
+    fn worker_exited_before_connecting() -> ReplicationError {
+        ReplicationError::backend("native worker thread exited before connecting")
     }
 
     // ── Query execution ─────────────────────────────────────────────────
@@ -810,6 +911,7 @@ impl NativeConnection {
     /// caller-supplied, not a blanket default. libpq takes the same position: it
     /// ships `connect_timeout` and no statement deadline.
     fn run_query(&mut self, sql: &str) -> Result<NativePgResult> {
+        self.ensure_no_abandoned_command()?;
         match &mut self.driver {
             Driver::Inline { worker, handle, .. } => run_sync(handle, worker.query(sql)),
             Driver::Threaded { cmd_tx, .. } => {
@@ -817,7 +919,7 @@ impl NativeConnection {
                 cmd_tx
                     .send(Command::Query {
                         sql: sql.to_string(),
-                        reply: reply_tx,
+                        reply: Reply::Blocking(reply_tx),
                     })
                     .map_err(|_| Self::worker_gone())?;
                 reply_rx.recv().map_err(|_| Self::worker_gone())?
@@ -827,6 +929,7 @@ impl NativeConnection {
 
     /// Run a CopyIn query: inline on the worker, or over the command channel.
     fn run_query_copy_in(&mut self, sql: &str, payload: &[u8]) -> Result<NativePgResult> {
+        self.ensure_no_abandoned_command()?;
         match &mut self.driver {
             Driver::Inline { worker, handle, .. } => {
                 run_sync(handle, worker.query_copy_in(sql, payload))
@@ -837,12 +940,57 @@ impl NativeConnection {
                     .send(Command::QueryCopyIn {
                         sql: sql.to_string(),
                         payload: Bytes::copy_from_slice(payload),
-                        reply: reply_tx,
+                        reply: Reply::Blocking(reply_tx),
                     })
                     .map_err(|_| Self::worker_gone())?;
                 reply_rx.recv().map_err(|_| Self::worker_gone())?
             }
         }
+    }
+
+    /// Async [`run_query`](Self::run_query). Same no-deadline policy.
+    ///
+    /// A future dropped before the reply leaves `command_in_flight` set, because the transport may hold half a reply, and every later command is then refused.
+    async fn run_query_async(&mut self, sql: &str) -> Result<NativePgResult> {
+        self.ensure_no_abandoned_command()?;
+        self.command_in_flight = true;
+        let result = match &mut self.driver {
+            Driver::Inline { worker, .. } => worker.query(sql).await,
+            Driver::Threaded { cmd_tx, .. } => {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                Self::await_worker(
+                    cmd_tx,
+                    Command::Query {
+                        sql: sql.to_string(),
+                        reply: Reply::Async(reply_tx),
+                    },
+                    reply_rx,
+                )
+                .await
+            }
+        };
+        self.command_in_flight = false;
+        result
+    }
+
+    async fn await_worker(
+        cmd_tx: &mpsc::UnboundedSender<Command>,
+        command: Command,
+        reply: oneshot::Receiver<Result<NativePgResult>>,
+    ) -> Result<NativePgResult> {
+        cmd_tx.send(command).map_err(|_| Self::worker_gone())?;
+        reply.await.map_err(|_| Self::worker_reply_dropped())?
+    }
+
+    fn ensure_no_abandoned_command(&self) -> Result<()> {
+        if self.command_in_flight {
+            return Err(ReplicationError::protocol(
+                "a previous command on this connection was cancelled before its reply arrived, \
+                 so the connection can no longer be used"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     #[cold]
@@ -869,26 +1017,32 @@ impl NativeConnection {
     /// Every internal caller issues its command while idle and only then records
     /// the new mode, so none of them are affected.
     pub fn exec(&mut self, sql: &str) -> Result<NativePgResult> {
-        match self.copy {
-            CopyMode::Idle => {}
-            CopyMode::Out { .. } => {
-                return Err(ReplicationError::protocol(
-                    "cannot run a query while a COPY OUT is in progress on this connection"
-                        .to_string(),
-                ))
-            }
-            CopyMode::Replication => {
-                return Err(ReplicationError::protocol(
-                    "cannot run a query while this connection is streaming replication".to_string(),
-                ))
-            }
-        }
-
+        self.ensure_idle()?;
         let result = self.run_query(sql)?;
+        Self::checked(sql, result)
+    }
 
-        let status_str = format!("{:?}", result.status());
-        debug!("query : {} pg_result.status() : {}", sql, status_str);
+    /// Non-blocking [`exec`](Self::exec). Dropping the future mid-reply leaves the connection refusing every later command.
+    pub async fn exec_async(&mut self, sql: &str) -> Result<NativePgResult> {
+        self.ensure_idle()?;
+        let result = self.run_query_async(sql).await?;
+        Self::checked(sql, result)
+    }
 
+    fn ensure_idle(&self) -> Result<()> {
+        match self.copy {
+            CopyMode::Idle => Ok(()),
+            CopyMode::Out { .. } => Err(ReplicationError::protocol(
+                "cannot run a query while a COPY OUT is in progress on this connection".to_string(),
+            )),
+            CopyMode::Replication => Err(ReplicationError::protocol(
+                "cannot run a query while this connection is streaming replication".to_string(),
+            )),
+        }
+    }
+
+    fn checked(sql: &str, result: NativePgResult) -> Result<NativePgResult> {
+        debug!("query : {} pg_result.status() : {:?}", sql, result.status());
         if !result.is_ok() {
             let error_msg = result
                 .error_message()
@@ -898,7 +1052,6 @@ impl NativeConnection {
                 format!("Query execution failed: {error_msg}"),
             ));
         }
-
         Ok(result)
     }
 
@@ -906,21 +1059,29 @@ impl NativeConnection {
     pub fn identify_system(&mut self) -> Result<NativePgResult> {
         debug!("Sending IDENTIFY_SYSTEM command");
         let result = self.exec("IDENTIFY_SYSTEM")?;
-
-        if result.ntuples() > 0 {
-            if let (Some(systemid), Some(timeline), Some(xlogpos)) = (
-                result.get_value(0, 0),
-                result.get_value(0, 1),
-                result.get_value(0, 2),
-            ) {
-                debug!(
-                    "System identification: systemid={}, timeline={}, xlogpos={}",
-                    systemid, timeline, xlogpos
-                );
-            }
-        }
-
+        Self::log_identity(&result);
         Ok(result)
+    }
+
+    /// Non-blocking [`identify_system`](Self::identify_system).
+    pub async fn identify_system_async(&mut self) -> Result<NativePgResult> {
+        debug!("Sending IDENTIFY_SYSTEM command");
+        let result = self.exec_async("IDENTIFY_SYSTEM").await?;
+        Self::log_identity(&result);
+        Ok(result)
+    }
+
+    fn log_identity(result: &NativePgResult) {
+        if let (Some(systemid), Some(timeline), Some(xlogpos)) = (
+            result.get_value(0, 0),
+            result.get_value(0, 1),
+            result.get_value(0, 2),
+        ) {
+            debug!(
+                "System identification: systemid={}, timeline={}, xlogpos={}",
+                systemid, timeline, xlogpos
+            );
+        }
     }
 
     // ── Replication ─────────────────────────────────────────────────────
@@ -934,8 +1095,24 @@ impl NativeConnection {
     ) -> Result<()> {
         let sql = crate::sql_builder::build_start_replication_sql(slot_name, start_lsn, options)?;
         debug!("Starting replication: {}", sql);
-
         let result = self.run_query(&sql)?;
+        self.enter_logical_replication(&result)
+    }
+
+    /// Non-blocking [`start_replication`](Self::start_replication).
+    pub async fn start_replication_async(
+        &mut self,
+        slot_name: &str,
+        start_lsn: XLogRecPtr,
+        options: &[(&str, &str)],
+    ) -> Result<()> {
+        let sql = crate::sql_builder::build_start_replication_sql(slot_name, start_lsn, options)?;
+        debug!("Starting replication: {}", sql);
+        let result = self.run_query_async(&sql).await?;
+        self.enter_logical_replication(&result)
+    }
+
+    fn enter_logical_replication(&mut self, result: &NativePgResult) -> Result<()> {
         if result.status() != &NativeResultStatus::CopyBoth {
             let error_msg = result
                 .error_message()
@@ -1161,8 +1338,10 @@ impl NativeConnection {
     // ── Connection info ─────────────────────────────────────────────────
 
     /// Check if the connection is still alive.
+    ///
+    /// False after an async command was cancelled mid-reply, since the transport may hold the rest of that reply.
     pub(crate) fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Relaxed)
+        self.alive.load(Ordering::Relaxed) && !self.command_in_flight
     }
 
     /// Force the connection to report dead.
@@ -1193,6 +1372,29 @@ impl NativeConnection {
         output_plugin: Option<&str>,
         options: &ReplicationSlotOptions,
     ) -> Result<NativePgResult> {
+        let sql = self.create_slot_sql(slot_name, slot_type, output_plugin, options)?;
+        self.exec(&sql)
+    }
+
+    /// Non-blocking [`create_replication_slot_with_options`](Self::create_replication_slot_with_options).
+    pub async fn create_replication_slot_with_options_async(
+        &mut self,
+        slot_name: &str,
+        slot_type: SlotType,
+        output_plugin: Option<&str>,
+        options: &ReplicationSlotOptions,
+    ) -> Result<NativePgResult> {
+        let sql = self.create_slot_sql(slot_name, slot_type, output_plugin, options)?;
+        self.exec_async(&sql).await
+    }
+
+    fn create_slot_sql(
+        &self,
+        slot_name: &str,
+        slot_type: SlotType,
+        output_plugin: Option<&str>,
+        options: &ReplicationSlotOptions,
+    ) -> Result<String> {
         let sql = crate::sql_builder::prepare_create_slot(
             self.server_version(),
             slot_name,
@@ -1201,7 +1403,7 @@ impl NativeConnection {
             options,
         )?;
         debug!("Creating replication slot: {}", sql);
-        self.exec(&sql)
+        Ok(sql)
     }
 
     /// Alter a replication slot (logical slots only).
@@ -1226,9 +1428,25 @@ impl NativeConnection {
 
     /// Drop a replication slot.
     pub fn drop_replication_slot(&mut self, slot_name: &str, wait: bool) -> Result<()> {
+        let sql = Self::drop_slot_sql(slot_name, wait)?;
+        let result = self.exec(&sql)?;
+        Self::slot_dropped(slot_name, &result)
+    }
+
+    /// Non-blocking [`drop_replication_slot`](Self::drop_replication_slot).
+    pub async fn drop_replication_slot_async(&mut self, slot_name: &str, wait: bool) -> Result<()> {
+        let sql = Self::drop_slot_sql(slot_name, wait)?;
+        let result = self.exec_async(&sql).await?;
+        Self::slot_dropped(slot_name, &result)
+    }
+
+    fn drop_slot_sql(slot_name: &str, wait: bool) -> Result<String> {
         let sql = crate::sql_builder::build_drop_slot_sql(slot_name, wait)?;
         debug!("Dropping replication slot: {}", sql);
-        let result = self.exec(&sql)?;
+        Ok(sql)
+    }
+
+    fn slot_dropped(slot_name: &str, result: &NativePgResult) -> Result<()> {
         if !result.is_ok() {
             return Err(ReplicationError::replication_slot(format!(
                 "Failed to drop replication slot '{}': {}",
@@ -1605,14 +1823,20 @@ impl Drop for NativeConnection {
 impl NativeConnection {
     /// Create a null connection for testing (DO NOT call any methods that touch the DB)
     pub(crate) fn null_for_testing() -> Self {
-        // Create a pair of connected TCP sockets. The peer end is closed when
-        // this function returns, so any I/O the worker attempts on the socket
-        // fails deterministically rather than blocking.
+        // The peer end is closed when this function returns, so any I/O the
+        // worker attempts on the socket fails deterministically rather than
+        // blocking.
+        Self::silent_for_testing().0
+    }
+
+    /// A Threaded-driver connection whose server end is returned open and never
+    /// answers, so every command waits for as long as the caller holds the peer.
+    pub(crate) fn silent_for_testing() -> (Self, std::net::TcpStream) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let std_tcp = std::net::TcpStream::connect(addr).unwrap();
         std_tcp.set_nonblocking(true).unwrap();
-        let _peer = listener.accept().unwrap();
+        let (peer, _) = listener.accept().unwrap();
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std_mpsc::channel();
@@ -1629,7 +1853,7 @@ impl NativeConnection {
                         alive: worker_alive,
                     },
                     cmd_rx,
-                    ready_tx,
+                    Reply::Blocking(ready_tx),
                 )
             })
             .unwrap();
@@ -1641,7 +1865,7 @@ impl NativeConnection {
             .expect("null worker failed to adopt the test socket");
 
         // A null test connection is intentionally not alive.
-        Self {
+        let conn = Self {
             driver: Driver::Threaded {
                 cmd_tx,
                 worker: Some(worker),
@@ -1651,7 +1875,9 @@ impl NativeConnection {
             server_ver,
             copy: CopyMode::Idle,
             alive,
-        }
+            command_in_flight: false,
+        };
+        (conn, peer)
     }
 
     /// Create a null **inline-driver** connection for testing. Must be called on
@@ -1687,6 +1913,7 @@ impl NativeConnection {
             server_ver,
             copy: CopyMode::Idle,
             alive,
+            command_in_flight: false,
         }
     }
 
@@ -2106,6 +2333,7 @@ mod tests {
             server_ver: 160000,
             copy: CopyMode::Replication, // skip the replication-mode gate
             alive: Arc::new(AtomicBool::new(true)),
+            command_in_flight: false,
         };
 
         // Server streams two WAL messages; the inline read path drains both.
@@ -2179,6 +2407,7 @@ mod tests {
             server_ver: 160000,
             copy: CopyMode::Out { rx: None },
             alive: Arc::new(AtomicBool::new(true)),
+            command_in_flight: false,
         };
         (conn, server)
     }
@@ -2490,7 +2719,7 @@ mod tests {
         cmd_tx
             .send(Command::Query {
                 sql: "SELECT 1".to_string(),
-                reply: reply_tx,
+                reply: Reply::Blocking(reply_tx),
             })
             .expect("worker is still running");
 
@@ -2754,5 +2983,101 @@ mod tests {
         assert!(conn.end_copy().await.is_ok());
         // Flag cleared → a second call takes the no-op guard path.
         assert!(conn.end_copy().await.is_ok());
+    }
+
+    // === Async commands ===
+
+    fn query_reply() -> Vec<u8> {
+        let mut reply = tagged_frame(b'C', b"SELECT 0\0");
+        reply.extend_from_slice(&tagged_frame(b'Z', b"I"));
+        reply
+    }
+
+    async fn idle_inline_conn() -> (NativeConnection, tokio::net::TcpStream) {
+        let (worker, server) = worker_with_loopback().await;
+        let conn = NativeConnection {
+            driver: Driver::Inline {
+                worker,
+                pending: VecDeque::new(),
+                handle: tokio::runtime::Handle::current(),
+            },
+            server_ver: 160000,
+            copy: CopyMode::Idle,
+            alive: Arc::new(AtomicBool::new(true)),
+            command_in_flight: false,
+        };
+        (conn, server)
+    }
+
+    /// Cancels `exec_async` against a silent server, then checks that the connection refuses further commands and still drops promptly.
+    async fn assert_cancelled_command_poisons(mut conn: NativeConnection) {
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            conn.exec_async("SELECT 1"),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the silent server must not answer");
+        assert!(
+            !conn.is_alive(),
+            "a half-read reply makes the connection unusable"
+        );
+
+        let err = conn.exec_async("SELECT 1").await.unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        let err = conn.identify_system_async().await.unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || drop(conn)),
+        )
+        .await
+        .expect("dropping a connection with an abandoned command must not wait for the server")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn threaded_exec_async_returns_the_reply() {
+        use std::io::{Read, Write};
+        let (mut conn, mut peer) = NativeConnection::silent_for_testing();
+        let server = std::thread::spawn(move || {
+            let mut query = [0u8; 64];
+            let _ = peer.read(&mut query).unwrap();
+            peer.write_all(&query_reply()).unwrap();
+            peer
+        });
+        let result = conn.exec_async("SELECT 1").await.unwrap();
+        assert!(result.is_ok());
+        assert!(!conn.command_in_flight);
+        drop(server.join().unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inline_exec_async_returns_the_reply() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut conn, mut server) = idle_inline_conn().await;
+        let peer = tokio::spawn(async move {
+            let mut query = [0u8; 64];
+            let _ = server.read(&mut query).await.unwrap();
+            server.write_all(&query_reply()).await.unwrap();
+            server
+        });
+        let result = conn.exec_async("SELECT 1").await.unwrap();
+        assert!(result.is_ok());
+        assert!(!conn.command_in_flight);
+        drop(peer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_threaded_command_poisons_the_connection() {
+        let (conn, _peer) = NativeConnection::silent_for_testing();
+        conn.alive.store(true, Ordering::Relaxed);
+        assert_cancelled_command_poisons(conn).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_inline_command_poisons_the_connection() {
+        let (conn, _server) = idle_inline_conn().await;
+        assert_cancelled_command_poisons(conn).await;
     }
 }
