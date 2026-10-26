@@ -43,8 +43,8 @@ pub struct LogicalReplicationStream {
     last_health_check: Instant,
     /// Shared LSN feedback for communication with consumer. This allows the consumer to update flushed/applied LSN after commits
     pub shared_lsn_feedback: Arc<SharedLsnFeedback>,
-    /// `IDENTIFY_SYSTEM`'s identity from the first successful connection, re-checked on every reconnect. See [`ServerIdentity`].
-    identity: Option<ServerIdentity>,
+    /// `IDENTIFY_SYSTEM`'s identity from the connection `new()` opened, re-checked on every reconnect. See [`ServerIdentity`].
+    identity: ServerIdentity,
     /// Counter that throttles per-event time checks inside `next_event`. We only consult `Instant::now()` once every `FEEDBACK_CHECK_EVENT_INTERVAL` events so the hot path avoids a syscall on every message.
     feedback_check_counter: u32,
     /// Bounded replay terminal. See [`ReplayStop`].
@@ -210,29 +210,117 @@ const FEEDBACK_CHECK_EVENT_INTERVAL: u32 = 128;
 /// across this many events on the hot path.
 const HEALTH_CHECK_EVENT_INTERVAL: u32 = 1024;
 
-/// The `systemid` and `timeline` reported by `IDENTIFY_SYSTEM`.
+/// The cluster and timeline a replication connection is attached to, as reported by `IDENTIFY_SYSTEM`.
 ///
-/// Captured on the first connection and compared after every reconnect. Both
-/// values come from a row the connection already fetches, so the check costs
-/// nothing extra.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ServerIdentity {
-    system_id: String,
+/// [`LogicalReplicationStream::new`] reads it on the connection it opens, and every reconnect must report the same value or the stream fails with a permanent error. So it describes every connection the stream ever streams on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ServerIdentity {
+    system_id: u64,
     timeline: u32,
 }
 
 impl ServerIdentity {
-    /// Read the first row of an `IDENTIFY_SYSTEM` result.
-    ///
-    /// `None` when a column is missing or the timeline is not a number — an
-    /// unexpected result shape disables the check rather than failing the
-    /// connection, since the check is a safety net, not a requirement.
+    /// The cluster's system identifier, `IDENTIFY_SYSTEM`'s `systemid`.
+    #[inline]
+    pub fn system_id(&self) -> u64 {
+        self.system_id
+    }
+
+    /// The timeline the server was on when the stream connected.
+    #[inline]
+    pub fn timeline(&self) -> u32 {
+        self.timeline
+    }
+
+    /// Read the first row of an `IDENTIFY_SYSTEM` result, or `None` when a column is missing or not a number.
     fn from_identify_system(result: &crate::connection::PgResult) -> Option<Self> {
         Some(Self {
-            system_id: result.get_value(0, 0)?,
+            system_id: result.get_value(0, 0)?.parse().ok()?,
             timeline: result.get_value(0, 1)?.parse().ok()?,
         })
     }
+
+    /// Identify the server on the far end of `connection`, failing closed on a malformed reply.
+    fn identify(connection: &mut PgReplicationConnection) -> Result<Self> {
+        let result = connection.identify_system()?;
+        Self::from_identify_system(&result).ok_or_else(|| {
+            ReplicationError::permanent_connection(
+                "IDENTIFY_SYSTEM returned no usable system identifier and timeline, so the \
+                 cluster and timeline this stream resumes on cannot be confirmed"
+                    .to_string(),
+            )
+        })
+    }
+}
+
+/// One line of a timeline history file, naming an ancestor timeline and the WAL position where its successor branched off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimelineSwitch {
+    timeline: u32,
+    switchpoint: Lsn,
+}
+
+impl TimelineSwitch {
+    /// The ancestor timeline.
+    #[inline]
+    pub fn timeline(&self) -> u32 {
+        self.timeline
+    }
+
+    /// The first WAL position that belongs to the next timeline instead of this one.
+    #[inline]
+    pub fn switchpoint(&self) -> Lsn {
+        self.switchpoint
+    }
+}
+
+/// Parse the history file of `timeline` the way PostgreSQL's `readTimeLineHistory` does, oldest ancestor first.
+///
+/// Blank lines and `#` comments are skipped, each other line must start with an ancestor timeline and a switchpoint separated by whitespace, and ancestors must increase and stay below `timeline`.
+fn parse_timeline_history(timeline: u32, content: &str) -> Result<Vec<TimelineSwitch>> {
+    let malformed = |line: &str, why: &str| {
+        ReplicationError::protocol(format!(
+            "timeline {timeline} history line {line:?} is malformed: {why}"
+        ))
+    };
+    let mut history: Vec<TimelineSwitch> = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut fields = trimmed.split_whitespace();
+        let ancestor: u32 = fields
+            .next()
+            .and_then(|field| field.parse().ok())
+            .ok_or_else(|| malformed(line, "no ancestor timeline"))?;
+        let switchpoint = fields
+            .next()
+            .and_then(|field| crate::types::parse_lsn(field).ok())
+            .ok_or_else(|| malformed(line, "no switchpoint"))?;
+        if history
+            .last()
+            .is_some_and(|previous| previous.timeline >= ancestor)
+        {
+            return Err(malformed(line, "ancestor timelines must increase"));
+        }
+        if ancestor >= timeline {
+            return Err(malformed(
+                line,
+                "an ancestor must precede the timeline itself",
+            ));
+        }
+        history.push(TimelineSwitch {
+            timeline: ancestor,
+            switchpoint: Lsn::new(switchpoint),
+        });
+    }
+    if history.is_empty() {
+        return Err(ReplicationError::protocol(format!(
+            "timeline {timeline} history names no ancestor"
+        )));
+    }
+    Ok(history)
 }
 
 /// Configuration for the replication stream
@@ -639,6 +727,7 @@ impl LogicalReplicationStream {
     /// - Connection string is invalid
     /// - PostgreSQL version is too old (< 14.0)
     /// - Authentication fails
+    /// - `IDENTIFY_SYSTEM` fails or returns no usable system identifier and timeline
     ///
     /// # Example
     ///
@@ -677,11 +766,16 @@ impl LogicalReplicationStream {
         );
 
         // Establish initial connection with retry and enforce timeout
-        let connection = timeout_or_error(
+        let mut connection = timeout_or_error(
             config.connection_timeout,
             retry_handler.connect_with_retry(),
         )
         .await?;
+        let identity = ServerIdentity::identify(&mut connection)?;
+        info!(
+            "Connected to system {} on timeline {}",
+            identity.system_id, identity.timeline
+        );
 
         let parser = LogicalReplicationParser::with_protocol_version(config.protocol_version);
         let state = ReplicationState::new();
@@ -699,7 +793,7 @@ impl LogicalReplicationStream {
             retry_handler,
             last_health_check,
             shared_lsn_feedback,
-            identity: None,
+            identity,
             feedback_check_counter: 0,
             replay_stop: ReplayStop::Running,
             held: None,
@@ -707,18 +801,77 @@ impl LogicalReplicationStream {
         })
     }
 
+    /// The identity of the server this stream is connected to, read by [`new`](Self::new) on the stream's own connection.
+    ///
+    /// Reconnects that land on another cluster or timeline end the stream with a permanent error instead of replacing this value.
+    #[inline]
+    pub fn server_identity(&self) -> &ServerIdentity {
+        &self.identity
+    }
+
+    /// The replication slot's `confirmed_flush_lsn`, read on the stream's own connection, or `None` when the slot does not exist.
+    ///
+    /// A point-in-time read that must run before [`start`](Self::start), while the connection still accepts queries. The stream never feeds the value into its feedback. Requires a `replication=database` connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stream is already streaming, when the query fails, or when the slot is not a logical slot.
+    pub async fn slot_confirmed_flush_lsn(&mut self) -> Result<Option<Lsn>> {
+        let sql = crate::sql_builder::build_slot_confirmed_flush_sql(&self.config.slot_name)?;
+        let result = self.connection.exec(&sql)?;
+        if result.ntuples() == 0 {
+            return Ok(None);
+        }
+        let lsn = result
+            .get_value(0, 0)
+            .ok_or_else(|| {
+                ReplicationError::replication_slot(format!(
+                    "replication slot {} has no confirmed_flush_lsn, so it is not a logical slot",
+                    self.config.slot_name
+                ))
+            })
+            .and_then(|text| {
+                crate::types::parse_lsn(&text).map_err(|e| {
+                    ReplicationError::protocol(format!(
+                        "confirmed_flush_lsn {text:?} of replication slot {} is not an LSN: {e}",
+                        self.config.slot_name
+                    ))
+                })
+            })?;
+        Ok(Some(Lsn::new(lsn)))
+    }
+
+    /// The history of the timeline in [`server_identity`](Self::server_identity), oldest ancestor first, read on the stream's own connection.
+    ///
+    /// Empty on timeline 1, which has no ancestors. Like [`slot_confirmed_flush_lsn`](Self::slot_confirmed_flush_lsn), it must run before [`start`](Self::start).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stream is already streaming, when `TIMELINE_HISTORY` fails, or when its reply is not a well-formed history of that timeline.
+    pub async fn timeline_history(&mut self) -> Result<Vec<TimelineSwitch>> {
+        let timeline = self.identity.timeline;
+        if timeline == 1 {
+            return Ok(Vec::new());
+        }
+        let result = self
+            .connection
+            .exec(&format!("TIMELINE_HISTORY {timeline}"))?;
+        let content = (result.ntuples() == 1)
+            .then(|| result.get_value(0, 1))
+            .flatten()
+            .ok_or_else(|| {
+                ReplicationError::protocol(format!(
+                    "TIMELINE_HISTORY {timeline} returned {} rows instead of one history file",
+                    result.ntuples()
+                ))
+            })?;
+        parse_timeline_history(timeline, &content)
+    }
+
     /// Initialize the replication stream
     async fn initialize(&mut self) -> Result<()> {
         info!("Initializing replication stream");
-
-        // Identify the system, and remember who it is: a later reconnect that
-        // lands on a different cluster or a forked timeline is rejected.
-        let identity = self.connection.identify_system()?;
-        self.identity = ServerIdentity::from_identify_system(&identity);
-        info!("System identification successful");
-
         self.prepare_replication_slot().await?;
-
         info!("Replication stream initialized");
         Ok(())
     }
@@ -1188,9 +1341,7 @@ impl LogicalReplicationStream {
     ///
     /// Returns [`ReplicationError::ReplicationSlot`], which [`is_permanent`](ReplicationError::is_permanent) reports as `true`, so the  retry loop stops instead of reconnecting into the fork. Deciding whether the stored LSN survived requires the switchpoint from `TIMELINE_HISTORY <tli>`, which is a policy call left to the caller.
     fn check_server_identity(&self, current: &ServerIdentity) -> Result<()> {
-        let Some(previous) = self.identity.as_ref() else {
-            return Ok(());
-        };
+        let previous = &self.identity;
 
         if previous.system_id != current.system_id {
             return Err(ReplicationError::replication_slot(format!(
@@ -1226,36 +1377,9 @@ impl LogicalReplicationStream {
         )
         .await?;
 
-        // Re-initialize the connection. A reconnect can land somewhere other than where we left off, and the stored LSN is only meaningful on the original cluster and timeline.
-        let identity = self.connection.identify_system()?;
-        match ServerIdentity::from_identify_system(&identity) {
-            Some(current) => {
-                self.check_server_identity(&current)?;
-                self.identity = Some(current);
-            }
-            // Fail closed. An unreadable IDENTIFY_SYSTEM used to skip the check
-            // entirely, which is precisely backwards: we are about to resume from a
-            // stored LSN that is only meaningful on the same cluster and timeline,
-            // and we just lost the ability to confirm either. A conforming server
-            // always returns systemid and timeline, so getting here means the
-            // response was malformed — treat that as the mismatch it might be.
-            //
-            // `permanent_connection`, not `replication_slot`: the server never
-            // looked at the slot, and `ReplicationSlot` is documented as
-            // "invalidated / does not exist — drop it and re-sync", which would
-            // send an operator to destroy a healthy slot over a bad response.
-            None if self.identity.is_some() => {
-                return Err(ReplicationError::permanent_connection(
-                    "IDENTIFY_SYSTEM returned no usable system identifier/timeline on reconnect; \
-                     refusing to resume from the stored LSN without confirming the cluster and \
-                     timeline are unchanged"
-                        .to_string(),
-                ));
-            }
-            None => {
-                warn!("IDENTIFY_SYSTEM returned no usable identity; cluster/timeline changes cannot be detected");
-            }
-        }
+        // A reconnect can land somewhere other than where we left off, and the stored LSN is only meaningful on the original cluster and timeline. A malformed reply fails closed with `PermanentConnection`, never `ReplicationSlot`, which would send an operator to drop a healthy slot.
+        let current = ServerIdentity::identify(&mut self.connection)?;
+        self.check_server_identity(&current)?;
 
         // Temporary slots are dropped when the connection dies.
         if self.config.slot_options.temporary {
@@ -4830,7 +4954,7 @@ pub(crate) mod tests {
             ),
             last_health_check: Instant::now(),
             shared_lsn_feedback: SharedLsnFeedback::new_shared(),
-            identity: None,
+            identity: identity(7682, 1),
             feedback_check_counter: 0,
             replay_stop: ReplayStop::Running,
             held: None,
@@ -5007,12 +5131,12 @@ pub(crate) mod tests {
         );
         assert_eq!(
             ServerIdentity::from_identify_system(&r),
-            Some(identity("7682669593620992043", 2))
+            Some(identity(7_682_669_593_620_992_043, 2))
         );
     }
 
-    /// An unexpected result shape disables the check rather than failing the
-    /// connection, so each malformed case must yield `None`, not a panic.
+    /// Each malformed case must yield `None`, which `ServerIdentity::identify`
+    /// turns into a fail-closed error, never a panic.
     #[cfg(feature = "rustls-tls")]
     #[test]
     fn identity_returns_none_for_an_unusable_row() {
@@ -5032,29 +5156,68 @@ pub(crate) mod tests {
         // Timeline is SQL NULL.
         let null = identify_system_result(&["systemid", "timeline"], &[Some("7682"), None]);
         assert_eq!(ServerIdentity::from_identify_system(&null), None);
+
+        // System identifier is not a number.
+        let systemid = identify_system_result(&["systemid", "timeline"], &[Some("x"), Some("1")]);
+        assert_eq!(ServerIdentity::from_identify_system(&systemid), None);
     }
 
-    fn identity(system_id: &str, timeline: u32) -> ServerIdentity {
+    fn identity(system_id: u64, timeline: u32) -> ServerIdentity {
         ServerIdentity {
-            system_id: system_id.to_string(),
+            system_id,
             timeline,
         }
     }
 
-    /// The first connection has nothing to compare against, so anything passes.
+    fn switch(timeline: u32, switchpoint: u64) -> TimelineSwitch {
+        TimelineSwitch {
+            timeline,
+            switchpoint: Lsn::new(switchpoint),
+        }
+    }
+
+    /// A twice-promoted server's history lists both ancestors oldest first, with the reason text ignored.
     #[test]
-    fn identity_check_passes_before_the_first_connection() {
-        let stream = create_test_stream(create_test_config());
-        assert!(stream.identity.is_none());
-        assert!(stream.check_server_identity(&identity("7682", 1)).is_ok());
+    fn timeline_history_lists_every_ancestor_in_order() {
+        let content = "1\t0/3000158\tno recovery target specified\n\n\
+                       # restored from archive\n2\t0/5000000\tbefore 2026-10-25 12:00:00+00\n";
+        assert_eq!(
+            parse_timeline_history(3, content).unwrap(),
+            vec![switch(1, 0x300_0158), switch(2, 0x500_0000)]
+        );
+    }
+
+    #[test]
+    fn timeline_history_rejects_malformed_files() {
+        for (timeline, content) in [
+            (2, ""),
+            (2, "# only a comment\n"),
+            (2, "one\t0/1\treason\n"),
+            (2, "1\n"),
+            (2, "1\tnot-an-lsn\treason\n"),
+            (3, "2\t0/2\ta\n1\t0/1\tb\n"),
+            (3, "1\t0/1\ta\n1\t0/2\tb\n"),
+            (2, "2\t0/1\treason\n"),
+        ] {
+            assert!(
+                parse_timeline_history(timeline, content).is_err(),
+                "timeline {timeline} history {content:?} must be rejected"
+            );
+        }
+    }
+
+    /// Timeline 1 has no history file, so the read answers without a round trip.
+    #[tokio::test]
+    async fn timeline_one_has_an_empty_history() {
+        let mut stream = create_test_stream(create_test_config());
+        assert_eq!(stream.timeline_history().await.unwrap(), Vec::new());
     }
 
     /// Reconnecting to the same cluster on the same timeline is the normal case.
     #[test]
     fn identity_check_passes_on_an_unchanged_server() {
-        let mut stream = create_test_stream(create_test_config());
-        stream.identity = Some(identity("7682", 1));
-        assert!(stream.check_server_identity(&identity("7682", 1)).is_ok());
+        let stream = create_test_stream(create_test_config());
+        assert!(stream.check_server_identity(&identity(7682, 1)).is_ok());
     }
 
     /// A promoted standby keeps the primary's systemid, so only the timeline
@@ -5063,10 +5226,10 @@ pub(crate) mod tests {
     #[test]
     fn identity_check_rejects_a_timeline_switch() {
         let mut stream = create_test_stream(create_test_config());
-        stream.identity = Some(identity("7682", 1));
+        stream.identity = identity(7682, 1);
 
         let err = stream
-            .check_server_identity(&identity("7682", 2))
+            .check_server_identity(&identity(7682, 2))
             .unwrap_err();
         assert!(
             matches!(err, ReplicationError::ReplicationSlot(_)),
@@ -5083,10 +5246,10 @@ pub(crate) mod tests {
     #[test]
     fn identity_check_rejects_a_different_cluster() {
         let mut stream = create_test_stream(create_test_config());
-        stream.identity = Some(identity("7682", 1));
+        stream.identity = identity(7682, 1);
 
         let err = stream
-            .check_server_identity(&identity("9999", 1))
+            .check_server_identity(&identity(9999, 1))
             .unwrap_err();
         assert!(err.is_permanent(), "{err}");
         let msg = err.to_string();
@@ -5099,10 +5262,10 @@ pub(crate) mod tests {
     #[test]
     fn identity_check_reports_the_cluster_when_both_differ() {
         let mut stream = create_test_stream(create_test_config());
-        stream.identity = Some(identity("7682", 1));
+        stream.identity = identity(7682, 1);
 
         let msg = stream
-            .check_server_identity(&identity("9999", 3))
+            .check_server_identity(&identity(9999, 3))
             .unwrap_err()
             .to_string();
         assert!(msg.contains("different cluster"), "{msg}");
@@ -7564,16 +7727,12 @@ pub(crate) mod tests {
     // Tests for initialize() path coverage
     // ========================================
 
-    /// Verify that initialize() calls ensure_replication_slot(). Since we use
-    /// `create_test_stream` with a null connection, calling identify_system()
-    /// will fail, so we verify the error is from that call and not from
-    /// ensure_replication_slot().
+    /// `initialize()` creates the slot, which a null connection cannot do.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn test_initialize_fails_on_identify_system_with_null_conn() {
+    async fn test_initialize_fails_on_slot_creation_with_null_conn() {
         let config = create_test_config();
         let mut stream = create_test_stream(config);
 
-        // initialize() calls identify_system() first, which will fail with null conn
         let result = stream.initialize().await;
         assert!(result.is_err());
     }
