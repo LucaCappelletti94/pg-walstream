@@ -1612,11 +1612,11 @@ impl LogicalReplicationStream {
     ///
     /// The method tracks the last sent LSN values to enable intelligent throttling
     /// and avoid sending redundant status updates.
+    ///
+    /// A stream that has not received anything yet reports all three positions as
+    /// zero. The walsender counts that update against `wal_sender_timeout` and
+    /// leaves the slot's `confirmed_flush_lsn` where it is.
     pub async fn send_feedback(&mut self) -> Result<()> {
-        if self.state.last_received_lsn == 0 {
-            return Ok(());
-        }
-
         // Fetch the consumer's committed progress (capped to what we've received).
         // This allows the consumer to update these values after committing to destination.
         let (flushed_lsn, applied_lsn) = self.capped_feedback_lsns();
@@ -6002,14 +6002,13 @@ pub(crate) mod tests {
         assert_eq!(stream.state.last_received_lsn, 0x4000);
     }
 
+    /// A keepalive asking for a reply is answered even before anything was received.
     #[tokio::test]
     async fn test_process_keepalive_reply_requested_no_received() {
-        // When received lsn is 0, send_feedback is a no-op (won't crash on null conn)
         let mut stream = create_test_stream(create_test_config());
         let data = build_keepalive_message(0, true);
-        let result = stream.process_keepalive_message(&data).await;
-        // send_feedback returns early if last_received_lsn == 0
-        assert!(result.is_ok());
+        // The null connection fails every send, so an error shows a reply was attempted.
+        assert!(stream.process_keepalive_message(&data).await.is_err());
     }
 
     #[test]
@@ -6149,12 +6148,12 @@ pub(crate) mod tests {
         }
     }
 
+    /// A stream that has received nothing yet still sends a status update, which is what keeps an unread stream alive.
     #[tokio::test]
     async fn test_send_feedback_no_received_lsn() {
         let mut stream = create_test_stream(create_test_config());
-        // send_feedback should return Ok(()) when last_received_lsn is 0
-        let result = stream.send_feedback().await;
-        assert!(result.is_ok());
+        // The null connection fails every send, so an error shows the update was attempted.
+        assert!(stream.send_feedback().await.is_err());
     }
 
     #[test]
