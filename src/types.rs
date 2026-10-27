@@ -778,6 +778,10 @@ pub struct ReplicationSlotInfo {
 }
 
 /// Represents a single change event from PostgreSQL logical replication
+///
+/// To ship events between processes, serialize them with a self-describing serde
+/// format such as CBOR, MessagePack or JSON. bincode and postcard cannot read a
+/// [`ColumnValue`], whose deserializer relies on `deserialize_any`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeEvent {
     /// Type of the event with embedded data
@@ -2066,6 +2070,28 @@ mod tests {
         let mut padded = CachePadded::new(String::from("hello"));
         padded.push_str(" world");
         assert_eq!(&*padded, "hello world");
+    }
+
+    /// A self-describing binary serde format round-trips a row event, the documented way to ship events.
+    #[test]
+    fn change_event_round_trips_through_cbor() {
+        let data = RowData::from_pairs(vec![
+            ("id", ColumnValue::text("1")),
+            ("note", ColumnValue::Null),
+            (
+                "blob",
+                ColumnValue::binary_bytes(Bytes::from_static(&[0xde, 0xad])),
+            ),
+        ]);
+        let event = ChangeEvent::insert("public", "t", 7, data, Lsn::new(0x10))
+            .with_metadata(BTreeMap::from([("k".to_string(), "v".to_string())]));
+
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&event, &mut cbor).unwrap();
+        let decoded: ChangeEvent = ciborium::from_reader(cbor.as_slice()).unwrap();
+        assert_eq!(decoded.event_type, event.event_type);
+        assert_eq!(decoded.lsn, event.lsn);
+        assert_eq!(decoded.metadata, event.metadata);
     }
 
     #[test]
