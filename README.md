@@ -299,7 +299,7 @@ A complete, runnable version of the above — including a row inserted *during* 
 
 `capture_aligned` copies extra tables through a temporary side slot's exported snapshot, exact at its consistent point `C`. Commit the `ALTER PUBLICATION ... ADD TABLE` first. A table added while the capture waits can lose a row written before the `ALTER` committed.
 
-The walsender drops a stream that sends no status update for `wal_sender_timeout`, so keep calling `send_feedback()` while the capture waits and while the copy loads. The capture future borrows nothing from the stream:
+The walsender drops a stream that sends no status update for `wal_sender_timeout`, so keep calling `send_feedback()` while the capture waits and while the copy loads. The capture future borrows nothing from the stream. Do not read the stream until the capture returns, because a read can pass `C`, which `next_event_before` cannot undo:
 
 ```rust
 let capture = stream.capture_aligned(&[("public", "orders")]);

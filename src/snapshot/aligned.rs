@@ -48,7 +48,9 @@ use tokio_util::sync::CancellationToken;
 /// [`send_feedback`](LogicalReplicationStream::send_feedback) more often than
 /// that, for example once a second. The future that
 /// [`capture_aligned`](LogicalReplicationStream::capture_aligned) returns
-/// borrows nothing from the stream, so the two can run side by side.
+/// borrows nothing from the stream, so the two can run side by side. Do not
+/// read the stream until the capture returns, because a read can pass `C`,
+/// which `next_event_before` cannot undo.
 ///
 /// # Cost
 ///
@@ -516,7 +518,8 @@ mod tests {
             .with_slot_type(SlotType::Physical);
         let mut stream = crate::stream::tests::create_test_stream(config);
         let capture = tokio::spawn(stream.capture_aligned(&[("public", "a")]));
-        stream.send_feedback().await.unwrap();
+        // Only the mutable borrow matters here. The null connection may refuse the send.
+        let _ = stream.send_feedback().await;
         let err = match capture.await.unwrap() {
             Ok(_) => panic!("a physical stream has no publication to copy through"),
             Err(e) => e,
