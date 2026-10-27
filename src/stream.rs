@@ -1616,6 +1616,12 @@ impl LogicalReplicationStream {
     /// A stream that has not received anything yet reports all three positions as
     /// zero. The walsender counts that update against `wal_sender_timeout` and
     /// leaves the slot's `confirmed_flush_lsn` where it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplicationError::Protocol`] before [`start`](Self::start), because
+    /// the connection is not in replication mode yet, and the connection's error when
+    /// the status update cannot be written.
     pub async fn send_feedback(&mut self) -> Result<()> {
         // Fetch the consumer's committed progress (capped to what we've received).
         // This allows the consumer to update these values after committing to destination.
@@ -6148,12 +6154,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// A stream that has received nothing yet still sends a status update, which is what keeps an unread stream alive.
+    /// Before `start()` there is no replication session, so `send_feedback()` reports it instead of claiming success.
     #[tokio::test]
     async fn test_send_feedback_no_received_lsn() {
         let mut stream = create_test_stream(create_test_config());
-        // The null connection fails every send, so an error shows the update was attempted.
-        assert!(stream.send_feedback().await.is_err());
+        let err = stream.send_feedback().await.unwrap_err();
+        assert!(matches!(err, ReplicationError::Protocol(_)), "{err:?}");
     }
 
     #[test]
