@@ -885,6 +885,7 @@ dependencies = [
  "aws-lc-rs",
  "bytes",
  "chrono",
+ "ciborium",
  "codspeed-criterion-compat",
  "futures",
  "futures-core",
