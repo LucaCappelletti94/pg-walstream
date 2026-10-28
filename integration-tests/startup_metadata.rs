@@ -186,3 +186,67 @@ async fn slot_position_of_a_physical_slot_is_an_error() {
     drop(stream);
     drop_slot(&mut regular, slot);
 }
+
+/// The blocking commands kept next to their `_async` siblings still reach the server: identify it, create a temporary slot and start streaming from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn blocking_commands_identify_create_and_start() {
+    let slot = "it_startup_blocking";
+    let mut regular = regular();
+    drop_slot(&mut regular, slot);
+    let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {slot}"));
+    regular
+        .exec(&format!("CREATE PUBLICATION {slot}"))
+        .expect("publication");
+
+    let stream = LogicalReplicationStream::new(&replication_conn_string(), config(slot, slot))
+        .await
+        .expect("stream");
+    let expected = *stream.server_identity();
+
+    let mut conn =
+        PgReplicationConnection::connect(&replication_conn_string()).expect("blocking connect");
+    let identified = conn.identify_system().expect("IDENTIFY_SYSTEM");
+    assert_eq!(
+        identified
+            .get_value(0, 0)
+            .and_then(|v| v.parse::<u64>().ok()),
+        Some(expected.system_id())
+    );
+    assert_eq!(
+        identified
+            .get_value(0, 1)
+            .and_then(|v| v.parse::<u32>().ok()),
+        Some(expected.timeline())
+    );
+
+    let created = conn
+        .create_replication_slot_with_options(
+            slot,
+            pg_walstream::SlotType::Logical,
+            Some("pgoutput"),
+            &pg_walstream::ReplicationSlotOptions {
+                temporary: true,
+                ..Default::default()
+            },
+        )
+        .expect("CREATE_REPLICATION_SLOT");
+    assert_eq!(created.get_value(0, 0).as_deref(), Some(slot));
+
+    conn.start_replication(
+        slot,
+        0,
+        &[
+            ("proto_version", "1"),
+            ("publication_names", &format!("\"{slot}\"")),
+        ],
+    )
+    .expect("START_REPLICATION");
+    assert!(
+        conn.exec("SELECT 1").is_err(),
+        "a streaming connection must refuse queries"
+    );
+
+    drop(conn);
+    let _ = regular.exec(&format!("DROP PUBLICATION IF EXISTS {slot}"));
+}
