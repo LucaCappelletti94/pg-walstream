@@ -799,12 +799,12 @@ impl LogicalReplicationParser {
             }
         };
 
-        let streaming_message = match change_xid.or(self.streaming_context) {
-            Some(xid) => StreamingReplicationMessage::new_streaming(message, xid),
-            None => StreamingReplicationMessage::new(message),
-        };
-
-        Ok(streaming_message)
+        let xid = change_xid.or(self.streaming_context);
+        Ok(StreamingReplicationMessage {
+            message,
+            is_streaming: xid.is_some(),
+            xid,
+        })
     }
 
     /// Parse BEGIN message
