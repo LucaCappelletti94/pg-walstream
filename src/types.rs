@@ -741,7 +741,8 @@ impl EventType {
     /// until `CommitPrepared`.
     ///
     /// `Insert`, `Update` and `Delete` carry no transaction id. Take it from the
-    /// enclosing `Begin`, or from `StreamStart` inside a streamed chunk. Only the
+    /// enclosing `Begin`, or from `StreamStart` inside a streamed chunk, where
+    /// [`ChangeEvent::xid`] also names the subtransaction a change belongs to. Only the
     /// commit event always carries the commit position, because a streamed or
     /// prepared transaction has no `Begin` with a final position, so a
     /// transaction is applied at its commit event.

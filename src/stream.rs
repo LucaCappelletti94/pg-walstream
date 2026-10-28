@@ -8849,15 +8849,12 @@ pub(crate) mod tests {
     }
 
     fn begin_event(final_lsn: u64) -> ChangeEvent {
-        ChangeEvent {
-            event_type: EventType::Begin {
-                transaction_id: 1,
-                final_lsn: Lsn::new(final_lsn),
-                commit_timestamp: chrono::Utc::now(),
-            },
-            lsn: Lsn::new(final_lsn),
-            metadata: None,
-        }
+        ChangeEvent::begin(
+            1,
+            Lsn::new(final_lsn),
+            chrono::Utc::now(),
+            Lsn::new(final_lsn),
+        )
     }
 
     /// An event an abandoned poll read past the boundary is kept, not delivered early.
