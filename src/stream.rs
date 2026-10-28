@@ -232,24 +232,26 @@ impl ServerIdentity {
         self.timeline
     }
 
-    /// Read the first row of an `IDENTIFY_SYSTEM` result, or `None` when a column is missing or not a number.
-    fn from_identify_system(result: &crate::connection::PgResult) -> Option<Self> {
-        Some(Self {
-            system_id: result.get_value(0, 0)?.parse().ok()?,
-            timeline: result.get_value(0, 1)?.parse().ok()?,
-        })
-    }
-
-    /// Identify the server on the far end of `connection`, failing closed on a malformed reply.
-    async fn identify(connection: &mut PgReplicationConnection) -> Result<Self> {
-        let result = connection.identify_system_async().await?;
-        Self::from_identify_system(&result).ok_or_else(|| {
+    /// Read the first row of an `IDENTIFY_SYSTEM` result, failing closed when a column is missing or not a number.
+    fn from_identify_system(result: &crate::connection::PgResult) -> Result<Self> {
+        let parsed = || {
+            Some(Self {
+                system_id: result.get_value(0, 0)?.parse().ok()?,
+                timeline: result.get_value(0, 1)?.parse().ok()?,
+            })
+        };
+        parsed().ok_or_else(|| {
             ReplicationError::permanent_connection(
                 "IDENTIFY_SYSTEM returned no usable system identifier and timeline, so the \
                  cluster and timeline this stream resumes on cannot be confirmed"
                     .to_string(),
             )
         })
+    }
+
+    /// Identify the server on the far end of `connection`.
+    async fn identify(connection: &mut PgReplicationConnection) -> Result<Self> {
+        Self::from_identify_system(&connection.identify_system_async().await?)
     }
 }
 
@@ -272,6 +274,44 @@ impl TimelineSwitch {
     pub fn switchpoint(&self) -> Lsn {
         self.switchpoint
     }
+}
+
+/// Read `confirmed_flush_lsn` out of the slot query's reply, `None` when the slot does not exist.
+fn confirmed_flush_lsn_from(
+    slot_name: &str,
+    result: &crate::connection::PgResult,
+) -> Result<Option<Lsn>> {
+    if result.ntuples() == 0 {
+        return Ok(None);
+    }
+    let text = result.get_value(0, 0).ok_or_else(|| {
+        ReplicationError::replication_slot(format!(
+            "replication slot {slot_name} has no confirmed_flush_lsn, so it is not a logical slot"
+        ))
+    })?;
+    let lsn = crate::types::parse_lsn(&text).map_err(|e| {
+        ReplicationError::protocol(format!(
+            "confirmed_flush_lsn {text:?} of replication slot {slot_name} is not an LSN: {e}"
+        ))
+    })?;
+    Ok(Some(Lsn::new(lsn)))
+}
+
+/// Read the history file out of a `TIMELINE_HISTORY` reply, which must hold exactly one row.
+fn timeline_history_from(
+    timeline: u32,
+    result: &crate::connection::PgResult,
+) -> Result<Vec<TimelineSwitch>> {
+    let content = (result.ntuples() == 1)
+        .then(|| result.get_value(0, 1))
+        .flatten()
+        .ok_or_else(|| {
+            ReplicationError::protocol(format!(
+                "TIMELINE_HISTORY {timeline} returned {} rows instead of one history file",
+                result.ntuples()
+            ))
+        })?;
+    parse_timeline_history(timeline, &content)
 }
 
 /// Parse the history file of `timeline` the way PostgreSQL's `readTimeLineHistory` does, oldest ancestor first.
@@ -818,26 +858,7 @@ impl LogicalReplicationStream {
     pub async fn slot_confirmed_flush_lsn(&mut self) -> Result<Option<Lsn>> {
         let sql = crate::sql_builder::build_slot_confirmed_flush_sql(&self.config.slot_name)?;
         let result = self.connection.exec_async(&sql).await?;
-        if result.ntuples() == 0 {
-            return Ok(None);
-        }
-        let lsn = result
-            .get_value(0, 0)
-            .ok_or_else(|| {
-                ReplicationError::replication_slot(format!(
-                    "replication slot {} has no confirmed_flush_lsn, so it is not a logical slot",
-                    self.config.slot_name
-                ))
-            })
-            .and_then(|text| {
-                crate::types::parse_lsn(&text).map_err(|e| {
-                    ReplicationError::protocol(format!(
-                        "confirmed_flush_lsn {text:?} of replication slot {} is not an LSN: {e}",
-                        self.config.slot_name
-                    ))
-                })
-            })?;
-        Ok(Some(Lsn::new(lsn)))
+        confirmed_flush_lsn_from(&self.config.slot_name, &result)
     }
 
     /// The history of the timeline in [`server_identity`](Self::server_identity), oldest ancestor first, read on the stream's own connection.
@@ -856,16 +877,7 @@ impl LogicalReplicationStream {
             .connection
             .exec_async(&format!("TIMELINE_HISTORY {timeline}"))
             .await?;
-        let content = (result.ntuples() == 1)
-            .then(|| result.get_value(0, 1))
-            .flatten()
-            .ok_or_else(|| {
-                ReplicationError::protocol(format!(
-                    "TIMELINE_HISTORY {timeline} returned {} rows instead of one history file",
-                    result.ntuples()
-                ))
-            })?;
-        parse_timeline_history(timeline, &content)
+        timeline_history_from(timeline, &result)
     }
 
     /// Initialize the replication stream
@@ -5163,36 +5175,75 @@ pub(crate) mod tests {
             ],
         );
         assert_eq!(
-            ServerIdentity::from_identify_system(&r),
-            Some(identity(7_682_669_593_620_992_043, 2))
+            ServerIdentity::from_identify_system(&r).unwrap(),
+            identity(7_682_669_593_620_992_043, 2)
         );
     }
 
-    /// Each malformed case must yield `None`, which `ServerIdentity::identify`
-    /// turns into a fail-closed error, never a panic.
+    /// Each malformed reply fails closed with a permanent error, never a panic and never a guessed identity.
     #[cfg(feature = "rustls-tls")]
     #[test]
-    fn identity_returns_none_for_an_unusable_row() {
-        // No rows at all.
+    fn identity_rejects_an_unusable_row() {
         let mut empty = crate::connection::PgResult::new();
         empty.columns = vec!["systemid".into(), "timeline".into()];
-        assert_eq!(ServerIdentity::from_identify_system(&empty), None);
+        for reply in [
+            empty,
+            identify_system_result(&["systemid"], &[Some("7682")]),
+            identify_system_result(&["systemid", "timeline"], &[Some("7682"), Some("x")]),
+            identify_system_result(&["systemid", "timeline"], &[Some("7682"), None]),
+            identify_system_result(&["systemid", "timeline"], &[Some("x"), Some("1")]),
+        ] {
+            let err = ServerIdentity::from_identify_system(&reply).unwrap_err();
+            assert!(
+                matches!(err, ReplicationError::PermanentConnection(_)),
+                "{err:?}"
+            );
+        }
+    }
 
-        // Timeline column missing.
-        let short = identify_system_result(&["systemid"], &[Some("7682")]);
-        assert_eq!(ServerIdentity::from_identify_system(&short), None);
+    /// A missing slot is `None`, a physical slot's NULL is a slot error, and a value that is not an LSN is a protocol error.
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn confirmed_flush_lsn_reads_every_reply_shape() {
+        let mut missing = crate::connection::PgResult::new();
+        missing.columns = vec!["confirmed_flush_lsn".into()];
+        assert_eq!(confirmed_flush_lsn_from("s", &missing).unwrap(), None);
 
-        // Timeline present but not a number.
-        let bad = identify_system_result(&["systemid", "timeline"], &[Some("7682"), Some("x")]);
-        assert_eq!(ServerIdentity::from_identify_system(&bad), None);
+        let present = identify_system_result(&["confirmed_flush_lsn"], &[Some("0/16B3748")]);
+        assert_eq!(
+            confirmed_flush_lsn_from("s", &present).unwrap(),
+            Some(Lsn::new(0x16B_3748))
+        );
 
-        // Timeline is SQL NULL.
-        let null = identify_system_result(&["systemid", "timeline"], &[Some("7682"), None]);
-        assert_eq!(ServerIdentity::from_identify_system(&null), None);
+        let physical = identify_system_result(&["confirmed_flush_lsn"], &[None]);
+        let err = confirmed_flush_lsn_from("s", &physical).unwrap_err();
+        assert!(
+            matches!(err, ReplicationError::ReplicationSlot(_)),
+            "{err:?}"
+        );
 
-        // System identifier is not a number.
-        let systemid = identify_system_result(&["systemid", "timeline"], &[Some("x"), Some("1")]);
-        assert_eq!(ServerIdentity::from_identify_system(&systemid), None);
+        let garbage = identify_system_result(&["confirmed_flush_lsn"], &[Some("x")]);
+        let err = confirmed_flush_lsn_from("s", &garbage).unwrap_err();
+        assert!(matches!(err, ReplicationError::Protocol(_)), "{err:?}");
+    }
+
+    /// The history file is the reply's second column, and a reply without exactly one row is refused.
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn timeline_history_reads_the_reply_row() {
+        let reply = identify_system_result(
+            &["filename", "content"],
+            &[Some("00000002.history"), Some("1\t0/3000158\tpromoted\n")],
+        );
+        let history = timeline_history_from(2, &reply).unwrap();
+        assert_eq!(history, vec![switch(1, 0x300_0158)]);
+        assert_eq!(history[0].timeline(), 1);
+        assert_eq!(history[0].switchpoint(), Lsn::new(0x300_0158));
+
+        let mut empty = crate::connection::PgResult::new();
+        empty.columns = vec!["filename".into(), "content".into()];
+        let err = timeline_history_from(2, &empty).unwrap_err();
+        assert!(matches!(err, ReplicationError::Protocol(_)), "{err:?}");
     }
 
     fn identity(system_id: u64, timeline: u32) -> ServerIdentity {

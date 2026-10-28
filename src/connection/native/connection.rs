@@ -2543,6 +2543,23 @@ mod tests {
         );
     }
 
+    /// A query sent while a COPY OUT is still draining is refused before any I/O, so the copy is not interleaved with another reply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_async_refuses_a_query_during_a_copy_out() {
+        let (mut conn, _server) = inline_conn_in_copy_out().await;
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.exec_async("SELECT 1"),
+        )
+        .await
+        .expect("the guard must reject before any I/O")
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("COPY OUT is in progress"),
+            "{err}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copy_out_abort_marks_dead_and_clears_the_stream() {
         let (mut conn, _server) = inline_conn_in_copy_out().await;

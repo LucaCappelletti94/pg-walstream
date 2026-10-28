@@ -724,6 +724,43 @@ async fn snapshot_cancelled_during_slot_creation_leaves_no_slot() {
     assert_eq!(count(&mut probe), 0, "slot {slot} reappeared");
 }
 
+/// A snapshot that fails after creating its slot, here because the publication
+/// carries no table, drops that slot again instead of leaving it for the next
+/// attempt to mistake for a pre-existing subscription.
+#[tokio::test]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn a_snapshot_failing_after_slot_creation_drops_the_slot() {
+    let (slot, publication) = ("it_snap_empty_pub", "snap_empty_pub");
+    let _guard = slot_guard(slot);
+    let mut admin = regular_conn();
+    let _ = admin.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
+    admin
+        .exec(&format!("CREATE PUBLICATION {publication}"))
+        .expect("create empty publication");
+
+    let stream = LogicalReplicationStream::new(
+        &replication_conn_string(),
+        snapshot_config(slot, publication),
+    )
+    .await
+    .expect("connect");
+    let err = match stream.snapshot().await {
+        Ok(_) => panic!("a publication without tables has nothing to snapshot"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("no tables"), "{err}");
+
+    let remaining = probe_count(
+        &admin
+            .exec(&format!(
+                "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{slot}'"
+            ))
+            .expect("count slots"),
+    );
+    assert_eq!(remaining, 0, "the failed snapshot left slot {slot} behind");
+    let _ = admin.exec(&format!("DROP PUBLICATION IF EXISTS {publication}"));
+}
+
 #[tokio::test]
 #[ignore = "requires live PostgreSQL with wal_level=logical"]
 async fn abandon_returns_the_stream_and_start_succeeds() {
