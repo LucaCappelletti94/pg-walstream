@@ -15,9 +15,9 @@
 //! ```
 
 use pg_walstream::{
-    AlignedSnapshot, CancellationToken, ColumnValue, EventType, LogicalReplicationStream, Lsn,
-    PgReplicationConnection, PgResult, ReplicationError, ReplicationStreamConfig, RowData,
-    StreamingMode,
+    AlignedSnapshot, CancellationToken, ChangeEvent, ColumnValue, EventType,
+    LogicalReplicationStream, Lsn, PgReplicationConnection, PgResult, ReplicationError,
+    ReplicationStreamConfig, RowData, StreamingMode,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -609,14 +609,19 @@ impl StrictSink {
     }
 }
 
+/// A change waiting for its transaction's commit: the xid it arrived with, the
+/// row, its new value, and whether the row must already exist.
+type Pending = (Option<u32>, i64, Option<String>, bool);
+
 /// The merge the documentation describes. Each transaction's changes to the
 /// copied table wait for its commit event, which drops them below `C` and
-/// applies them at or past it.
+/// applies them at or past it. A subtransaction's `StreamAbort` drops the
+/// waiting changes that carry its xid.
 struct DocumentedMerge {
     c: Lsn,
     prefix: &'static str,
     current: Option<u32>,
-    open: HashMap<u32, Vec<(i64, Option<String>, bool)>>,
+    open: HashMap<u32, Vec<Pending>>,
     sink: StrictSink,
 }
 
@@ -631,8 +636,8 @@ impl DocumentedMerge {
         }
     }
 
-    fn event(&mut self, event: EventType) {
-        match event {
+    fn event(&mut self, event: ChangeEvent) {
+        match event.event_type {
             EventType::Begin { transaction_id, .. }
             | EventType::StreamStart { transaction_id, .. }
             | EventType::BeginPrepare { transaction_id, .. } => self.current = Some(transaction_id),
@@ -655,8 +660,12 @@ impl DocumentedMerge {
                 transaction_id,
                 subtransaction_xid,
                 ..
-            } if transaction_id == subtransaction_xid => {
-                self.open.remove(&transaction_id);
+            } => {
+                if transaction_id == subtransaction_xid {
+                    self.open.remove(&transaction_id);
+                } else if let Some(changes) = self.open.get_mut(&transaction_id) {
+                    changes.retain(|change| change.0 != Some(subtransaction_xid));
+                }
             }
             EventType::RollbackPrepared { transaction_id, .. } => {
                 self.open.remove(&transaction_id);
@@ -667,7 +676,7 @@ impl DocumentedMerge {
                     self.open
                         .entry(xid)
                         .or_default()
-                        .push((row, value, must_exist));
+                        .push((event.xid, row, value, must_exist));
                 }
             }
         }
@@ -676,7 +685,7 @@ impl DocumentedMerge {
     fn commit(&mut self, xid: u32, commit_lsn: Lsn) {
         let changes = self.open.remove(&xid).unwrap_or_default();
         if commit_lsn >= self.c {
-            for (row, value, must_exist) in changes {
+            for (_, row, value, must_exist) in changes {
                 self.sink.apply(row, value, must_exist);
             }
         }
@@ -688,9 +697,9 @@ impl DocumentedMerge {
 struct Recording {
     prefix: &'static str,
     c: Lsn,
-    before: Vec<EventType>,
+    before: Vec<ChangeEvent>,
     copy: Vec<(i64, String)>,
-    after: Vec<EventType>,
+    after: Vec<ChangeEvent>,
 }
 
 impl Recording {
@@ -703,7 +712,7 @@ impl Recording {
         let c = snapshot.consistent_point();
         let mut before = Vec::new();
         while let Some(event) = stream.next_event_before(c, &cancel).await.unwrap() {
-            before.push(event.event_type);
+            before.push(event);
         }
         let mut copy = Vec::new();
         while let Some(row) = snapshot.next_row().await.unwrap() {
@@ -712,8 +721,8 @@ impl Recording {
         snapshot.finish().unwrap();
         let mut after = Vec::new();
         loop {
-            let event = stream.next_event(&cancel).await.unwrap().event_type;
-            if matches!(step(event.clone(), prefix), Step::Sentinel) {
+            let event = stream.next_event(&cancel).await.unwrap();
+            if matches!(step(event.event_type.clone(), prefix), Step::Sentinel) {
                 break;
             }
             after.push(event);
@@ -730,7 +739,7 @@ impl Recording {
     fn changes_before(&self) -> usize {
         self.before
             .iter()
-            .filter(|e| matches!(step((*e).clone(), self.prefix), Step::Change(..)))
+            .filter(|e| matches!(step(e.event_type.clone(), self.prefix), Step::Change(..)))
             .count()
     }
 
@@ -753,7 +762,9 @@ impl Recording {
     fn merge_naively(&self) -> StrictSink {
         let mut sink = StrictSink::default();
         for event in &self.before {
-            if let Step::Change(row, value, must_exist) = step(event.clone(), self.prefix) {
+            if let Step::Change(row, value, must_exist) =
+                step(event.event_type.clone(), self.prefix)
+            {
                 sink.apply(row, value, must_exist);
             }
         }
@@ -915,7 +926,9 @@ async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
 
 /// A streamed and a prepared transaction that write before `C` and commit at or
 /// past it reach the consumer as chunks and `BeginPrepare..Prepare` before the
-/// `None`, their commits after it, and the documented merge stays exact.
+/// `None`, their commits after it, and the documented merge stays exact. The
+/// streamed transaction also rolls back a savepoint whose rows were already
+/// streamed, which the merge undoes by their xid.
 ///
 /// Slot creation waits for the transactions running when it starts (`b1`), then
 /// for those running at its next snapshot (`b2`). A transaction that starts once
@@ -975,6 +988,12 @@ async fn streamed_and_prepared_transactions_straddling_c_merge_at_their_commit()
             &mut streamed,
             "INSERT INTO aligned_straddle_new SELECT g, repeat('s', 200) FROM generate_series(1000, 2999) g",
         );
+        exec(&mut streamed, "SAVEPOINT rolled_back");
+        exec(
+            &mut streamed,
+            "INSERT INTO aligned_straddle_new SELECT g, repeat('r', 200) FROM generate_series(3000, 3999) g",
+        );
+        exec(&mut streamed, "ROLLBACK TO SAVEPOINT rolled_back");
         let mut prepared = regular_conn();
         exec(&mut prepared, "BEGIN");
         exec(&mut prepared, "INSERT INTO aligned_straddle_new VALUES (5000, 'p')");
@@ -988,13 +1007,22 @@ async fn streamed_and_prepared_transactions_straddling_c_merge_at_their_commit()
         exec(&mut admin, "INSERT INTO aligned_straddle_old VALUES (-1, 'sentinel')");
 
         let recording = Recording::take(&mut stream, snapshot, prefix).await;
-        let before = &recording.before;
-        assert!(before.iter().any(|e| matches!(e, EventType::StreamStart { .. })), "{before:?}");
-        assert!(before.iter().any(|e| matches!(e, EventType::BeginPrepare { .. })), "{before:?}");
-        assert!(before.iter().any(|e| matches!(e, EventType::Prepare { .. })), "{before:?}");
+        let types: Vec<&EventType> = recording.before.iter().map(|e| &e.event_type).collect();
+        assert!(types.iter().any(|e| matches!(e, EventType::StreamStart { .. })), "{types:?}");
+        assert!(types.iter().any(|e| matches!(e, EventType::BeginPrepare { .. })), "{types:?}");
+        assert!(types.iter().any(|e| matches!(e, EventType::Prepare { .. })), "{types:?}");
+        assert!(
+            types.iter().any(|e| matches!(
+                e,
+                EventType::StreamAbort { transaction_id, subtransaction_xid, .. }
+                    if transaction_id != subtransaction_xid
+            )),
+            "{types:?}"
+        );
         let commits_after: Vec<Lsn> = recording
             .after
             .iter()
+            .map(|e| &e.event_type)
             .filter(|e| matches!(e, EventType::StreamCommit { .. } | EventType::CommitPrepared { .. }))
             .filter_map(EventType::commit_lsn)
             .collect();

@@ -33,7 +33,9 @@ use tokio_util::sync::CancellationToken;
 /// [`commit_lsn`](crate::EventType::commit_lsn). Below `C`, apply it without the
 /// copied tables' rows. At or past `C`, apply it in full, after the copy. A
 /// transaction that ends in `RollbackPrepared` or in a `StreamAbort` of the
-/// whole transaction is dropped.
+/// whole transaction is dropped. A `StreamAbort` of a subtransaction drops the
+/// buffered changes whose [`ChangeEvent::xid`](crate::ChangeEvent::xid) equals
+/// its `subtransaction_xid`.
 ///
 /// [`next_event_before`](LogicalReplicationStream::next_event_before) returns
 /// `None` once every commit below `C` has been delivered, which is where the
