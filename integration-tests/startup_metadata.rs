@@ -13,6 +13,49 @@ use pg_walstream::{
     ReplicationStreamConfig, RetryConfig,
 };
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// `url` rerouted through a local proxy that holds every server reply for 5 ms, so no round trip completes within a single poll.
+async fn through_a_slow_proxy(url: &str) -> (String, tokio::task::JoinHandle<()>) {
+    let (scheme, rest) = url.split_once("://").expect("URI connection string");
+    let (userinfo, rest) = rest.rsplit_once('@').expect("user in the URI");
+    let path_at = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (server, tail) = rest.split_at(path_at);
+    let server = if server.contains(':') {
+        server.to_string()
+    } else {
+        format!("{server}:5432")
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxy = tokio::spawn(async move {
+        loop {
+            let (client, _) = listener.accept().await.unwrap();
+            let upstream = tokio::net::TcpStream::connect(&server).await.unwrap();
+            let (mut client_read, mut client_write) = client.into_split();
+            let (mut upstream_read, mut upstream_write) = upstream.into_split();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
+            });
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                while let Ok(n) = upstream_read.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    if client_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (
+        format!("{scheme}://{userinfo}@127.0.0.1:{port}{tail}"),
+        proxy,
+    )
+}
 
 fn replication_conn_string() -> String {
     std::env::var("DATABASE_URL").unwrap_or_else(|_| {
@@ -185,6 +228,22 @@ async fn slot_position_of_a_physical_slot_is_an_error() {
 
     drop(stream);
     drop_slot(&mut regular, slot);
+}
+
+/// `Duration::ZERO` is "no timeout", so a stream whose server answers in a few milliseconds still starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live PostgreSQL with wal_level=logical"]
+async fn a_zero_connection_timeout_does_not_bound_startup() {
+    let (url, proxy) = through_a_slow_proxy(&replication_conn_string()).await;
+    let stream = LogicalReplicationStream::new(
+        &url,
+        config("it_startup_zero", "it_startup_zero").with_connection_timeout(Duration::ZERO),
+    )
+    .await
+    .expect("Duration::ZERO means no timeout");
+    assert_ne!(stream.server_identity().system_id(), 0);
+    drop(stream);
+    proxy.abort();
 }
 
 /// The blocking commands kept next to their `_async` siblings still reach the server: identify it, create a temporary slot and start streaming from it.
