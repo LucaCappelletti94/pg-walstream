@@ -809,11 +809,13 @@ impl LogicalReplicationStream {
         let mut connection = retry_handler
             .connect_with_retry_within(config.connection_timeout)
             .await?;
-        let identity = timeout_or_error(
-            config.connection_timeout,
-            ServerIdentity::identify(&mut connection),
-        )
-        .await?;
+        // `Duration::ZERO` means no timeout, as it does for `connect_timeout`.
+        let identify = ServerIdentity::identify(&mut connection);
+        let identity = if config.connection_timeout.is_zero() {
+            identify.await
+        } else {
+            timeout_or_error(config.connection_timeout, identify).await
+        }?;
         info!(
             "Connected to system {} on timeline {}",
             identity.system_id, identity.timeline
