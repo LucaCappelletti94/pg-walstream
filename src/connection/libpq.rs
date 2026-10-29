@@ -270,8 +270,8 @@ impl ConnectOptions {
 
 /// Why one connection attempt ended without a connection.
 enum AttemptFailure {
-    /// An option libpq rejected, which every other attempt shares.
-    Options(ReplicationError),
+    /// libpq could not allocate a connection object, so no other attempt can start either.
+    Unallocated(ReplicationError),
     /// This server could not be reached in time or refused, with libpq's message.
     Failed(String),
 }
@@ -736,7 +736,9 @@ impl PgReplicationConnection {
         for attempt in &attempts {
             match Self::connect_attempt(&options, attempt, timeout).await {
                 Ok(conn) => return Self::from_established(conn),
-                Err(AttemptFailure::Options(e)) => return Err(e),
+                Err(AttemptFailure::Unallocated(e)) => return Err(e),
+                // An option every attempt shares fails each attempt with one message, which libpq reports once.
+                Err(AttemptFailure::Failed(message)) if errors.ends_with(&message) => {}
                 Err(AttemptFailure::Failed(message)) => errors.push_str(&message),
             }
         }
@@ -771,7 +773,7 @@ impl PgReplicationConnection {
             unsafe { PQconnectStartParams(key_ptrs.as_ptr(), value_ptrs.as_ptr(), 0) }
         };
         if conn.is_null() {
-            return Err(AttemptFailure::Options(
+            return Err(AttemptFailure::Unallocated(
                 ReplicationError::transient_connection(
                     "Failed to allocate PostgreSQL connection object".to_string(),
                 ),
@@ -782,11 +784,9 @@ impl PgReplicationConnection {
         let deadline = timeout.and_then(|t| tokio::time::Instant::now().checked_add(t));
         let mut half_open = HalfOpenConnection { conn, deadline };
 
-        // Parameter errors leave the connection already failed, and every attempt shares them.
+        // An invalid option or an address that fails at once, such as a missing socket directory, leaves the connection already failed.
         if unsafe { PQstatus(half_open.conn) } == ConnStatusType::CONNECTION_BAD {
-            return Err(AttemptFailure::Options(Self::classify_connect_error(
-                half_open.error_message(),
-            )));
+            return Err(AttemptFailure::Failed(half_open.error_message()));
         }
 
         // libpq documents the first wait as if `PQconnectPoll` had returned WRITING.
@@ -866,9 +866,7 @@ impl PgReplicationConnection {
         let parsed = unsafe { PQconninfoParse(c_conninfo.as_ptr(), &mut conninfo_err) };
         if parsed.is_null() {
             let msg = Self::take_conninfo_error(&mut conninfo_err);
-            return Err(Self::classify_connect_error(format!(
-                "Invalid connection string: {msg}"
-            )));
+            return Err(Self::classify_connect_error(msg));
         }
 
         let mut options = ConnectOptions {
@@ -3612,6 +3610,55 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// An address that fails at once, here a missing socket directory, does not stop the next host from being tried.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_async_moves_past_a_host_that_fails_at_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conninfo = format!(
+            "host=/nonexistent-pg-walstream-dir,127.0.0.1 port=5432,{port} dbname=async user=async sslmode=disable gssencmode=disable connect_timeout=1"
+        );
+        let connect = tokio::spawn(async move {
+            PgReplicationConnection::connect_async(&conninfo)
+                .await
+                .map(drop)
+        });
+        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("the second host was never tried")
+            .unwrap();
+        connect.abort();
+    }
+
+    /// An option every host shares is reported once, as `connect` reports it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_async_reports_a_shared_option_error_once() {
+        let conninfo =
+            "host=127.0.0.1,127.0.0.1 port=1,2 dbname=async user=async sslmode=bogus connect_timeout=1";
+        let sync = PgReplicationConnection::connect(conninfo)
+            .err()
+            .expect("bad sslmode");
+        let async_ = PgReplicationConnection::connect_async(conninfo)
+            .await
+            .err()
+            .expect("bad sslmode");
+        assert_eq!(async_.to_string(), sync.to_string());
+    }
+
+    /// A connection string libpq cannot parse classifies as the sync `connect` classifies it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_async_classifies_an_unparsable_conninfo_like_connect() {
+        let conninfo = "host a=b port=1 dbname=x user=x";
+        let sync = PgReplicationConnection::connect(conninfo)
+            .err()
+            .expect("unparsable");
+        let async_ = PgReplicationConnection::connect_async(conninfo)
+            .await
+            .err()
+            .expect("unparsable");
+        assert_eq!(async_.to_string(), sync.to_string());
     }
 
     /// A `connect_timeout` outside libpq's `int` range is rejected with libpq's message before anything connects.
