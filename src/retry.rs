@@ -251,6 +251,20 @@ impl ReplicationConnectionRetry {
     /// # }
     /// ```
     pub async fn connect_with_retry(&self) -> Result<PgReplicationConnection> {
+        self.connect_until(None).await
+    }
+
+    /// [`connect_with_retry`](Self::connect_with_retry) that stops once `budget` has passed, checked only between attempts.
+    ///
+    /// An attempt in flight is never cut short, because its own per-address `connect_timeout` bounds it and a multi-host attempt needs that time to reach its next host. A backoff that would end past `budget` ends at `budget` with [`connect_budget_exceeded`].
+    pub(crate) async fn connect_with_retry_within(
+        &self,
+        budget: Duration,
+    ) -> Result<PgReplicationConnection> {
+        self.connect_until(Some(budget)).await
+    }
+
+    async fn connect_until(&self, budget: Option<Duration>) -> Result<PgReplicationConnection> {
         let start_time = Instant::now();
         let mut backoff = self.config.to_backoff();
 
@@ -301,6 +315,13 @@ impl ReplicationConnectionRetry {
 
                     // Wait before the next attempt
                     let delay = backoff.next_delay();
+                    if let Some(budget) = budget {
+                        let remaining = budget.saturating_sub(start_time.elapsed());
+                        if delay >= remaining {
+                            tokio::time::sleep(remaining).await;
+                            return Err(connect_budget_exceeded(budget));
+                        }
+                    }
                     debug!("Waiting {:?} before next attempt", delay);
                     tokio::time::sleep(delay).await;
                 }
@@ -316,9 +337,96 @@ impl ReplicationConnectionRetry {
     }
 }
 
+/// The error a connect gives once its time budget has passed.
+pub(crate) fn connect_budget_exceeded(budget: Duration) -> ReplicationError {
+    ReplicationError::timeout(format!("Connection attempt exceeded timeout of {budget:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixed_backoff(max_attempts: u32, initial_delay: Duration) -> RetryConfig {
+        RetryConfig {
+            max_attempts,
+            initial_delay,
+            max_delay: Duration::from_secs(60),
+            multiplier: 1.0,
+            max_duration: Duration::from_secs(300),
+            jitter: false,
+        }
+    }
+
+    /// The budget never cuts an attempt short, so a multi-host attempt can still reach its next host after the first one's `connect_timeout`.
+    #[tokio::test]
+    async fn an_attempt_in_flight_outlives_the_connect_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(sock);
+        });
+        let retry = ReplicationConnectionRetry::new(
+            fixed_backoff(1, Duration::from_secs(1)),
+            format!(
+                "host=127.0.0.1 port={port} user=u dbname=db sslmode=disable gssencmode=disable connect_timeout=2"
+            ),
+        );
+
+        let start = Instant::now();
+        let err = match tokio::time::timeout(
+            Duration::from_secs(10),
+            retry.connect_with_retry_within(Duration::from_millis(300)),
+        )
+        .await
+        .expect("the attempt's own connect_timeout must end it")
+        {
+            Ok(_) => panic!("the server never answers"),
+            Err(e) => e,
+        };
+        assert!(!matches!(err, ReplicationError::Timeout(_)), "{err:?}");
+        assert!(
+            start.elapsed() >= Duration::from_millis(1500),
+            "the budget cut the attempt after {:?}",
+            start.elapsed()
+        );
+        silent.abort();
+    }
+
+    /// A backoff that would end past the budget ends at the budget with a timeout instead.
+    #[tokio::test]
+    async fn a_backoff_past_the_connect_budget_times_out_at_the_budget() {
+        // Bind then drop, so the port is almost certainly closed -> ECONNREFUSED.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let retry = ReplicationConnectionRetry::new(
+            fixed_backoff(3, Duration::from_secs(5)),
+            format!(
+                "host=127.0.0.1 port={port} user=u dbname=db sslmode=disable gssencmode=disable"
+            ),
+        );
+
+        let start = Instant::now();
+        let err = match retry
+            .connect_with_retry_within(Duration::from_millis(300))
+            .await
+        {
+            Ok(_) => panic!("nothing should be listening on a just-released port"),
+            Err(e) => e,
+        };
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(&err, ReplicationError::Timeout(m) if m == "Connection attempt exceeded timeout of 300ms"),
+            "{err:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(2),
+            "{elapsed:?}"
+        );
+    }
 
     /// The bug: a connection string that can never parse burned all five
     /// attempts and ~15 s of backoff before returning the error it already had

@@ -196,12 +196,242 @@ const COPY_IN_CHUNK: usize = 64 * 1024;
 /// libpq's `PG_ENCODING_UTF8` (libpq-fe.h), which pq-sys does not export.
 const PG_ENCODING_UTF8: i32 = 6;
 
-/// The `PQconnectStartParams` option arrays and the `connect_timeout` deadline.
-type ConnectOptions = (
-    Vec<CString>,
-    Vec<Option<CString>>,
-    Option<tokio::time::Instant>,
-);
+/// Where one `PQconnectPoll` attempt connects: libpq's `host`, `hostaddr` and `port` for a single server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConnectTarget {
+    host: Option<String>,
+    hostaddr: Option<String>,
+    port: Option<String>,
+}
+
+/// One `PQconnectPoll` attempt, with the `target_session_attrs` a `prefer-standby` pass overrides.
+struct ConnectAttempt {
+    target: ConnectTarget,
+    session_attrs: Option<&'static CStr>,
+}
+
+/// A connection string parsed for `connect_async`.
+struct ConnectOptions {
+    /// Every libpq keyword and its value for `PQconnectStartParams`, with `client_encoding` forced to UTF-8.
+    keys: Vec<CString>,
+    values: Vec<Option<CString>>,
+    /// Set when the conninfo names a `service`, whose file libpq expands only while connecting.
+    service: bool,
+    /// The effective values the attempt plan depends on, `None` when neither the conninfo nor libpq's defaults set them.
+    host: Option<String>,
+    hostaddr: Option<String>,
+    port: Option<String>,
+    connect_timeout: Option<String>,
+    load_balance_hosts: Option<String>,
+    target_session_attrs: Option<String>,
+}
+
+impl ConnectOptions {
+    /// The effective value slot for a keyword the attempt plan depends on.
+    fn planning_value(&mut self, keyword: &[u8]) -> Option<&mut Option<String>> {
+        Some(match keyword {
+            b"host" => &mut self.host,
+            b"hostaddr" => &mut self.hostaddr,
+            b"port" => &mut self.port,
+            b"connect_timeout" => &mut self.connect_timeout,
+            b"load_balance_hosts" => &mut self.load_balance_hosts,
+            b"target_session_attrs" => &mut self.target_session_attrs,
+            _ => return None,
+        })
+    }
+
+    /// The option arrays for one attempt: the conninfo's values with the attempt's server and session attributes in place.
+    fn attempt_values(&self, attempt: &ConnectAttempt) -> Vec<Option<CString>> {
+        let mut values = self.values.clone();
+        // A service's host list is libpq's to walk, so its attempt keeps the conninfo as written.
+        if !self.service {
+            let target = &attempt.target;
+            for (key, value) in self.keys.iter().zip(values.iter_mut()) {
+                let replacement = match key.to_bytes() {
+                    b"host" => &target.host,
+                    b"hostaddr" => &target.hostaddr,
+                    b"port" => &target.port,
+                    _ => continue,
+                };
+                // Keywords and values come from libpq's own C strings, so they hold no interior NUL.
+                *value = replacement.as_deref().and_then(|v| CString::new(v).ok());
+            }
+        }
+        if let Some(attrs) = attempt.session_attrs {
+            for (key, value) in self.keys.iter().zip(values.iter_mut()) {
+                if key.to_bytes() == b"target_session_attrs" {
+                    *value = Some(attrs.to_owned());
+                }
+            }
+        }
+        values
+    }
+}
+
+/// Why one connection attempt ended without a connection.
+enum AttemptFailure {
+    /// An option libpq rejected, which every other attempt shares.
+    Options(ReplicationError),
+    /// This server could not be reached in time or refused, with libpq's message.
+    Failed(String),
+}
+
+/// Why waiting on a half-open connection's socket stopped.
+enum SocketWait {
+    /// The attempt's `connect_timeout` deadline passed.
+    Deadline,
+    /// The socket could not be registered or waited on.
+    Failed(String),
+}
+
+/// `connect_timeout` as libpq reads it: a `strtol` integer within `int` range, `0` or negative for no limit, and `1` raised to `2` by libpq 16 and older.
+fn connect_timeout(
+    value: Option<&str>,
+    libpq_version: i32,
+) -> std::result::Result<Option<Duration>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    // `strtol` skips leading `isspace`, and libpq skips trailing whitespace after it.
+    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\u{0b}' | '\u{0c}' | '\r');
+    let secs: i32 = value.trim_matches(is_space).parse().map_err(|_| {
+        format!("invalid integer value \"{value}\" for connection option \"connect_timeout\"")
+    })?;
+    Ok(match secs {
+        ..=0 => None,
+        1 if libpq_version < 170_000 => Some(Duration::from_secs(2)),
+        secs => Some(Duration::from_secs(secs.unsigned_abs().into())),
+    })
+}
+
+/// Pair the comma-separated `host`, `hostaddr` and `port` lists into one target per server, as libpq's `connectOptions2` does.
+fn connect_slots(
+    host: Option<&str>,
+    hostaddr: Option<&str>,
+    port: Option<&str>,
+) -> std::result::Result<Vec<ConnectTarget>, String> {
+    let list = |value: Option<&str>| {
+        value
+            .filter(|v| !v.is_empty())
+            .map(|v| v.split(',').map(str::to_owned).collect::<Vec<_>>())
+    };
+    let (hosts, hostaddrs, ports) = (list(host), list(hostaddr), list(port));
+    let count = hostaddrs.as_ref().or(hosts.as_ref()).map_or(1, Vec::len);
+    if let (Some(hosts), Some(hostaddrs)) = (&hosts, &hostaddrs) {
+        if hosts.len() != hostaddrs.len() {
+            return Err(format!(
+                "could not match {} host names to {} hostaddr values",
+                hosts.len(),
+                hostaddrs.len()
+            ));
+        }
+    }
+    let ports = match ports {
+        Some(ports) if ports.len() == 1 => Some(vec![ports[0].clone(); count]),
+        Some(ports) if ports.len() != count => {
+            return Err(format!(
+                "could not match {} port numbers to {count} hosts",
+                ports.len()
+            ));
+        }
+        ports => ports,
+    };
+    let nth = |list: Option<&[String]>, i: usize| list.map(|l| l[i].clone());
+    Ok((0..count)
+        .map(|i| ConnectTarget {
+            host: nth(hosts.as_deref(), i),
+            hostaddr: nth(hostaddrs.as_deref(), i),
+            port: nth(ports.as_deref(), i),
+        })
+        .collect())
+}
+
+/// Whether libpq reads `host` as a Unix-domain socket directory rather than a name.
+fn is_unix_socket_host(host: &str) -> bool {
+    host.starts_with('/') || host.starts_with('@')
+}
+
+/// Resolve each server's name into one target per address, keeping `host` for TLS verification and passfile lookup.
+///
+/// Returns the targets grouped by server, and libpq-style messages for names that did not resolve.
+async fn resolve_slots(slots: Vec<ConnectTarget>) -> (Vec<Vec<ConnectTarget>>, String) {
+    let mut servers = Vec::with_capacity(slots.len());
+    let mut errors = String::new();
+    for slot in slots {
+        let name = match (&slot.host, &slot.hostaddr) {
+            (Some(host), None)
+                if !host.is_empty()
+                    && !is_unix_socket_host(host)
+                    && host.parse::<std::net::IpAddr>().is_err() =>
+            {
+                host.clone()
+            }
+            _ => {
+                servers.push(vec![slot]);
+                continue;
+            }
+        };
+        let resolved = tokio::net::lookup_host((name.as_str(), 0)).await;
+        match resolved {
+            Ok(addresses) => {
+                let targets: Vec<ConnectTarget> = addresses
+                    .map(|address| ConnectTarget {
+                        hostaddr: Some(address.ip().to_string()),
+                        ..slot.clone()
+                    })
+                    .collect();
+                if targets.is_empty() {
+                    errors.push_str(&format!(
+                        "could not translate host name \"{name}\" to address: no addresses\n"
+                    ));
+                } else {
+                    servers.push(targets);
+                }
+            }
+            Err(e) => errors.push_str(&format!(
+                "could not translate host name \"{name}\" to address: {e}\n"
+            )),
+        }
+    }
+    (servers, errors)
+}
+
+/// Shuffle in place for `load_balance_hosts=random`, seeded per call by the standard library's hasher keys.
+fn shuffle<T>(items: &mut [T]) {
+    use std::hash::{BuildHasher, Hasher};
+    let state = std::collections::hash_map::RandomState::new();
+    for i in (1..items.len()).rev() {
+        let mut hasher = state.build_hasher();
+        hasher.write_usize(i);
+        // `i + 1` fits in `u64` and the remainder is at most `i`, so the casts are lossless.
+        let j = (hasher.finish() % (i as u64 + 1)) as usize;
+        items.swap(i, j);
+    }
+}
+
+/// Every attempt in order. `prefer-standby` tries every address as a standby first, then every address in any mode, as libpq's two passes do.
+fn plan_attempts(servers: Vec<Vec<ConnectTarget>>, prefer_standby: bool) -> Vec<ConnectAttempt> {
+    let targets: Vec<ConnectTarget> = servers.into_iter().flatten().collect();
+    let attempt = |session_attrs| {
+        move |target| ConnectAttempt {
+            target,
+            session_attrs,
+        }
+    };
+    if prefer_standby {
+        let standby: Vec<ConnectAttempt> = targets
+            .iter()
+            .cloned()
+            .map(attempt(Some(c"standby")))
+            .collect();
+        standby
+            .into_iter()
+            .chain(targets.into_iter().map(attempt(Some(c"any"))))
+            .collect()
+    } else {
+        targets.into_iter().map(attempt(None)).collect()
+    }
+}
 
 /// Safe wrapper around PostgreSQL connection for replication
 ///
@@ -260,7 +490,7 @@ pub struct PgReplicationConnection {
 /// so a cancelled future releases the socket promptly.
 struct HalfOpenConnection {
     conn: *mut PGconn,
-    /// The deadline the conninfo's `connect_timeout` puts on the whole poll loop.
+    /// The deadline the conninfo's `connect_timeout` puts on this attempt.
     deadline: Option<tokio::time::Instant>,
 }
 
@@ -277,19 +507,50 @@ impl HalfOpenConnection {
         }
     }
 
+    /// The server this attempt is connecting to, worded as libpq prefixes its own connection errors.
+    fn server_prefix(&self) -> String {
+        let text = |ptr: *const c_char| {
+            if ptr.is_null() {
+                String::new()
+            } else {
+                // SAFETY: libpq returns a NUL-terminated string owned by the connection, read before any further call on it.
+                unsafe { CStr::from_ptr(ptr) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        let (host, hostaddr, port) = unsafe {
+            (
+                text(PQhost(self.conn)),
+                text(PQhostaddr(self.conn)),
+                text(PQport(self.conn)),
+            )
+        };
+        let port = if port.is_empty() {
+            "5432".to_string()
+        } else {
+            port
+        };
+        if is_unix_socket_host(&host) {
+            format!("connection to server on socket \"{host}/.s.PGSQL.{port}\" failed: ")
+        } else if !hostaddr.is_empty() && hostaddr != host {
+            format!("connection to server at \"{host}\" ({hostaddr}), port {port} failed: ")
+        } else {
+            format!("connection to server at \"{host}\", port {port} failed: ")
+        }
+    }
+
     /// Wait until the socket is ready in the direction `PQconnectPoll` asked for, or the deadline passes.
-    async fn await_socket(&mut self, writable: bool) -> Result<()> {
+    async fn await_socket(&mut self, writable: bool) -> std::result::Result<(), SocketWait> {
         let sock: RawFd = unsafe { PQsocket(self.conn) };
         if sock < 0 {
-            return Err(PgReplicationConnection::classify_connect_error(
-                self.error_message(),
-            ));
+            return Err(SocketWait::Failed(self.error_message()));
         }
         // Registered afresh on every wait: libpq may replace its socket between polls, even under the same descriptor number.
         // SAFETY: `sock` was just returned by `PQsocket` on a connection this struct owns, so it stays open for the call.
         let async_fd = register_dup(unsafe { BorrowedFd::borrow_raw(sock) }).map_err(|e| {
-            ReplicationError::protocol(format!(
-                "Failed to register PostgreSQL socket with the reactor: {e}"
+            SocketWait::Failed(format!(
+                "Failed to register PostgreSQL socket with the reactor: {e}\n"
             ))
         })?;
         let ready = async {
@@ -301,19 +562,12 @@ impl HalfOpenConnection {
         };
         let ready = match self.deadline {
             Some(deadline) => tokio::select! {
-                () = tokio::time::sleep_until(deadline) => {
-                    return Err(ReplicationError::transient_connection(
-                        "PostgreSQL connection failed (transient): connection to server timed out"
-                            .to_string(),
-                    ));
-                }
+                () = tokio::time::sleep_until(deadline) => return Err(SocketWait::Deadline),
                 ready = ready => ready,
             },
             None => ready.await,
         };
-        ready.map_err(|e| {
-            ReplicationError::protocol(format!("Failed to wait for socket readiness: {e}"))
-        })
+        ready.map_err(|e| SocketWait::Failed(format!("Failed to wait for socket readiness: {e}\n")))
     }
 
     /// Hand the established connection over, so dropping `self` no longer finishes it.
@@ -445,23 +699,62 @@ impl PgReplicationConnection {
 
     /// Non-blocking [`connect`](Self::connect), driving `PQconnectPoll` on `AsyncFd` socket readiness. Dropping the future closes the half-open connection.
     ///
-    /// `connect_timeout` bounds the whole attempt. `PQconnectdb` restarts it for each host of a multi-host connection string, which libpq's public API leaves no way to reproduce.
+    /// `PQconnectPoll` leaves `connect_timeout` and multi-host failover to its caller, so this runs `PQconnectdb`'s attempt loop itself: one attempt per address, each with its own `connect_timeout`, in libpq's order, honouring `load_balance_hosts` and `target_session_attrs=prefer-standby`. Host names resolve through tokio, so no `getaddrinfo` blocks the calling thread. Two differences remain. After an authentication failure the next address is still tried, because a failed connection exposes no SQLSTATE. A host list that only a conninfo's `service` file supplies is one attempt under one deadline.
     pub async fn connect_async(conninfo: &str) -> Result<Self> {
-        // Ensure libpq is properly initialized
-        unsafe {
-            let library_version = PQlibVersion();
-            debug!("Using libpq version: {}", library_version);
-        }
+        let libpq_version = unsafe { PQlibVersion() };
+        debug!("Using libpq version: {}", libpq_version);
 
         let c_conninfo = CString::new(conninfo)
             .map_err(|e| ReplicationError::connection(format!("Invalid connection string: {e}")))?;
+        let options = Self::parse_connect_options(&c_conninfo)?;
+        let timeout = connect_timeout(options.connect_timeout.as_deref(), libpq_version)
+            .map_err(Self::classify_connect_error)?;
 
-        let (keys, values, deadline) = Self::parse_connect_options(&c_conninfo)?;
+        let (attempts, mut errors) = if options.service {
+            let whole = ConnectTarget {
+                host: None,
+                hostaddr: None,
+                port: None,
+            };
+            (plan_attempts(vec![vec![whole]], false), String::new())
+        } else {
+            let slots = connect_slots(
+                options.host.as_deref(),
+                options.hostaddr.as_deref(),
+                options.port.as_deref(),
+            )
+            .map_err(Self::classify_connect_error)?;
+            let (mut servers, errors) = resolve_slots(slots).await;
+            if options.load_balance_hosts.as_deref() == Some("random") {
+                shuffle(&mut servers);
+                servers.iter_mut().for_each(|addresses| shuffle(addresses));
+            }
+            let prefer_standby = options.target_session_attrs.as_deref() == Some("prefer-standby");
+            (plan_attempts(servers, prefer_standby), errors)
+        };
 
+        for attempt in &attempts {
+            match Self::connect_attempt(&options, attempt, timeout).await {
+                Ok(conn) => return Self::from_established(conn),
+                Err(AttemptFailure::Options(e)) => return Err(e),
+                Err(AttemptFailure::Failed(message)) => errors.push_str(&message),
+            }
+        }
+        Err(Self::classify_connect_error(errors))
+    }
+
+    /// One `PQconnectStartParams` and `PQconnectPoll` loop against a single attempt's server, under its own deadline.
+    async fn connect_attempt(
+        options: &ConnectOptions,
+        attempt: &ConnectAttempt,
+        timeout: Option<Duration>,
+    ) -> std::result::Result<*mut PGconn, AttemptFailure> {
+        let values = options.attempt_values(attempt);
         // The raw-pointer vecs are dropped before the first await, so the future stays `Send`.
         let conn = {
             // `PQconnectStartParams` walks both arrays until a NULL sentinel.
-            let mut key_ptrs: Vec<*const c_char> = keys.iter().map(|k| k.as_ptr()).collect();
+            let mut key_ptrs: Vec<*const c_char> =
+                options.keys.iter().map(|k| k.as_ptr()).collect();
             key_ptrs.push(ptr::null());
             let mut value_ptrs: Vec<*const c_char> = values
                 .iter()
@@ -473,45 +766,66 @@ impl PgReplicationConnection {
             value_ptrs.push(ptr::null());
 
             // SAFETY: `key_ptrs` and `value_ptrs` are NULL-terminated arrays of valid C
-            // strings owned by `keys` and `values`, which outlive the block.
+            // strings owned by `options.keys` and `values`, which outlive the block.
             // `expand_dbname` is 0 because `PQconninfoParse` already expanded the connection string, so a database named like a connection string stays a name.
             unsafe { PQconnectStartParams(key_ptrs.as_ptr(), value_ptrs.as_ptr(), 0) }
         };
-
         if conn.is_null() {
-            return Err(ReplicationError::transient_connection(
-                "Failed to allocate PostgreSQL connection object".to_string(),
+            return Err(AttemptFailure::Options(
+                ReplicationError::transient_connection(
+                    "Failed to allocate PostgreSQL connection object".to_string(),
+                ),
             ));
         }
 
+        // The deadline starts with the attempt, as `PQconnectdb` restarts it per address.
+        let deadline = timeout.and_then(|t| tokio::time::Instant::now().checked_add(t));
         let mut half_open = HalfOpenConnection { conn, deadline };
 
-        // Parameter errors leave the connection already failed.
+        // Parameter errors leave the connection already failed, and every attempt shares them.
         if unsafe { PQstatus(half_open.conn) } == ConnStatusType::CONNECTION_BAD {
-            return Err(Self::classify_connect_error(half_open.error_message()));
+            return Err(AttemptFailure::Options(Self::classify_connect_error(
+                half_open.error_message(),
+            )));
         }
 
         // libpq documents the first wait as if `PQconnectPoll` had returned WRITING.
         let mut flag = PostgresPollingStatusType::PGRES_POLLING_WRITING;
         loop {
             match flag {
-                PostgresPollingStatusType::PGRES_POLLING_OK => break,
+                PostgresPollingStatusType::PGRES_POLLING_OK => {
+                    return Ok(half_open.into_established());
+                }
                 PostgresPollingStatusType::PGRES_POLLING_FAILED => {
-                    return Err(Self::classify_connect_error(half_open.error_message()));
+                    return Err(AttemptFailure::Failed(half_open.error_message()));
                 }
                 // `PGRES_POLLING_ACTIVE` comes only from `PQconnectPollExtended`, and re-polling after readability recovers it.
                 PostgresPollingStatusType::PGRES_POLLING_READING
                 | PostgresPollingStatusType::PGRES_POLLING_ACTIVE
                 | PostgresPollingStatusType::PGRES_POLLING_WRITING => {
-                    half_open
-                        .await_socket(flag == PostgresPollingStatusType::PGRES_POLLING_WRITING)
-                        .await?;
-                    flag = unsafe { PQconnectPoll(half_open.conn) };
+                    let writable = flag == PostgresPollingStatusType::PGRES_POLLING_WRITING;
+                    match half_open.await_socket(writable).await {
+                        Ok(()) => flag = unsafe { PQconnectPoll(half_open.conn) },
+                        Err(SocketWait::Deadline) => {
+                            return Err(AttemptFailure::Failed(format!(
+                                "{}timeout expired\n",
+                                half_open.server_prefix()
+                            )));
+                        }
+                        Err(SocketWait::Failed(message)) => {
+                            return Err(AttemptFailure::Failed(format!(
+                                "{}{message}",
+                                half_open.server_prefix()
+                            )));
+                        }
+                    }
                 }
             }
         }
-        let conn = half_open.into_established();
+    }
 
+    /// Check an established connection the way `connect` does, and take ownership of it.
+    fn from_established(conn: *mut PGconn) -> Result<Self> {
         // The startup packet forced `client_encoding=UTF8`; `options=-c
         // client_encoding=...` could have overridden it, so verify.
         if unsafe { PQclientEncoding(conn) } != PG_ENCODING_UTF8 {
@@ -544,71 +858,85 @@ impl PgReplicationConnection {
     }
 
     /// Parse a connection string into the option arrays `PQconnectStartParams`
-    /// takes, forcing `client_encoding` to UTF-8 and computing the `connect_timeout` deadline.
-    fn parse_connect_options(c_conninfo: &CString) -> Result<ConnectOptions> {
+    /// takes, forcing `client_encoding` to UTF-8, and read the effective values the attempt plan depends on.
+    fn parse_connect_options(c_conninfo: &CStr) -> Result<ConnectOptions> {
         let mut conninfo_err: *mut c_char = ptr::null_mut();
         // SAFETY: `c_conninfo` is a valid NUL-terminated C string that stays
         // alive for the call.
-        let options = unsafe { PQconninfoParse(c_conninfo.as_ptr(), &mut conninfo_err) };
-        if options.is_null() {
+        let parsed = unsafe { PQconninfoParse(c_conninfo.as_ptr(), &mut conninfo_err) };
+        if parsed.is_null() {
             let msg = Self::take_conninfo_error(&mut conninfo_err);
             return Err(Self::classify_connect_error(format!(
                 "Invalid connection string: {msg}"
             )));
         }
 
-        let mut keys: Vec<CString> = Vec::new();
-        let mut values: Vec<Option<CString>> = Vec::new();
-        let mut connect_timeout: Option<CString> = None;
+        let mut options = ConnectOptions {
+            keys: Vec::new(),
+            values: Vec::new(),
+            service: false,
+            host: None,
+            hostaddr: None,
+            port: None,
+            connect_timeout: None,
+            load_balance_hosts: None,
+            target_session_attrs: None,
+        };
 
-        // SAFETY: `options` is libpq's array of `PQconninfoOption`, terminated by an
+        // SAFETY: `parsed` is libpq's array of `PQconninfoOption`, terminated by an
         // entry with a NULL keyword. Keywords and values are NUL-terminated strings
         // owned by the array, copied out before `PQconninfoFree` releases it.
         unsafe {
-            let mut opt = options;
+            let mut opt = parsed;
             while !(*opt).keyword.is_null() {
                 let keyword = CStr::from_ptr((*opt).keyword);
                 let val = (!(*opt).val.is_null()).then(|| CStr::from_ptr((*opt).val).to_owned());
                 if keyword.to_bytes() == b"client_encoding" {
                     // The startup packet is the non-blocking stand-in for `PQsetClientEncoding`.
-                    keys.push(keyword.to_owned());
-                    values.push(Some(c"UTF8".to_owned()));
+                    options.keys.push(keyword.to_owned());
+                    options.values.push(Some(c"UTF8".to_owned()));
                 } else {
-                    if keyword.to_bytes() == b"connect_timeout" {
-                        connect_timeout = val.clone();
+                    if keyword.to_bytes() == b"service" {
+                        options.service = val.is_some();
                     }
-                    keys.push(keyword.to_owned());
-                    values.push(val);
+                    if let Some(slot) = options.planning_value(keyword.to_bytes()) {
+                        *slot = val.as_deref().map(|v| v.to_string_lossy().into_owned());
+                    }
+                    options.keys.push(keyword.to_owned());
+                    options.values.push(val);
                 }
                 opt = opt.add(1);
             }
-            PQconninfoFree(options);
+            PQconninfoFree(parsed);
         }
 
-        // `PQconnectPoll` leaves `connect_timeout` to the caller's loop, as `PQconnectdb` does.
-        let deadline = Self::connect_deadline(connect_timeout.as_deref())?;
-        Ok((keys, values, deadline))
+        // A conninfo `service` outranks the environment, and only libpq reads its file, so its values stay libpq's.
+        if !options.service {
+            Self::fill_from_defaults(&mut options);
+        }
+        Ok(options)
     }
 
-    /// The deadline `connect_timeout` sets, with libpq's rules: whole seconds, `0` or negative disables it, and `1` is raised to `2`.
-    fn connect_deadline(value: Option<&CStr>) -> Result<Option<tokio::time::Instant>> {
-        let Some(value) = value else {
-            return Ok(None);
-        };
-        let secs: i64 = value
-            .to_str()
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .ok_or_else(|| {
-                Self::classify_connect_error(format!(
-                    "invalid connection string: invalid value \"{}\" for parameter \"connect_timeout\"",
-                    value.to_string_lossy()
-                ))
-            })?;
-        Ok(u64::try_from(secs)
-            .ok()
-            .filter(|&secs| secs > 0)
-            .map(|secs| tokio::time::Instant::now() + Duration::from_secs(secs.max(2))))
+    /// Fill the planning values the conninfo left unset from `PQconndefaults`: the service file named by `PGSERVICE`, then the environment, then libpq's compiled defaults.
+    fn fill_from_defaults(options: &mut ConnectOptions) {
+        // SAFETY: `PQconndefaults` returns libpq's option array terminated by a NULL keyword, or NULL when out of memory. Its strings are copied out before `PQconninfoFree` releases it.
+        unsafe {
+            let defaults = PQconndefaults();
+            if defaults.is_null() {
+                return;
+            }
+            let mut opt = defaults;
+            while !(*opt).keyword.is_null() {
+                let keyword = CStr::from_ptr((*opt).keyword).to_bytes();
+                if let Some(slot) = options.planning_value(keyword) {
+                    if slot.is_none() && !(*opt).val.is_null() {
+                        *slot = Some(CStr::from_ptr((*opt).val).to_string_lossy().into_owned());
+                    }
+                }
+                opt = opt.add(1);
+            }
+            PQconninfoFree(defaults);
+        }
     }
 
     /// Take and free the error string `PQconninfoParse` left in `conninfo_err`.
@@ -3238,10 +3566,180 @@ mod tests {
             Err(e) => e,
         };
         assert!(
-            err.to_string().contains("timed out"),
+            err.to_string().contains("timeout expired"),
             "expected a connect-timeout error, got: {err}"
         );
         silent.abort();
+    }
+
+    /// A host that accepts and stays silent costs one `connect_timeout`, then the next host is tried, as `PQconnectdb` does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_async_moves_past_a_silent_host_after_its_timeout() {
+        async fn silent_host() -> (u16, tokio::sync::oneshot::Receiver<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (accepted, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let (sock, _) = listener.accept().await.unwrap();
+                let _ = accepted.send(());
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(sock);
+            });
+            (port, rx)
+        }
+        let (first, _) = silent_host().await;
+        let (second, mut second_reached) = silent_host().await;
+        let conninfo = format!(
+            "host=127.0.0.1,127.0.0.1 port={first},{second} dbname=async user=async sslmode=disable gssencmode=disable connect_timeout=1"
+        );
+        let err = match tokio::time::timeout(
+            Duration::from_secs(20),
+            PgReplicationConnection::connect_async(&conninfo),
+        )
+        .await
+        .expect("each host's own deadline must end the connect")
+        {
+            Ok(_) => panic!("both hosts are silent"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            second_reached.try_recv().is_ok(),
+            "the second host was never tried: {err}"
+        );
+        for port in [first, second] {
+            assert!(
+                err.contains(&format!("port {port} failed: timeout expired")),
+                "{err}"
+            );
+        }
+    }
+
+    /// A `connect_timeout` outside libpq's `int` range is rejected with libpq's message before anything connects.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_async_rejects_an_out_of_range_connect_timeout() {
+        for value in ["9223372036854775807", "2147483648"] {
+            let conninfo = format!(
+                "host=127.0.0.1 port=1 dbname=async user=async sslmode=disable connect_timeout={value}"
+            );
+            let err = match PgReplicationConnection::connect_async(&conninfo).await {
+                Ok(_) => panic!("{value} is not a libpq int"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains(&format!(
+                    "invalid integer value \"{value}\" for connection option \"connect_timeout\""
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    /// `connect_timeout` follows libpq's `strtol` rules, and only libpq 16 and older raise 1 s to 2 s.
+    #[test]
+    fn connect_timeout_follows_libpq_integer_rules() {
+        let secs = |value: &str, libpq: i32| connect_timeout(Some(value), libpq);
+        assert_eq!(secs(" 10 ", 170_000), Ok(Some(Duration::from_secs(10))));
+        assert_eq!(secs("+7", 170_000), Ok(Some(Duration::from_secs(7))));
+        assert_eq!(
+            secs("2147483647", 170_000),
+            Ok(Some(Duration::from_secs(2_147_483_647)))
+        );
+        assert_eq!(secs("0", 170_000), Ok(None));
+        assert_eq!(secs("-2147483648", 170_000), Ok(None));
+        assert_eq!(secs("1", 160_015), Ok(Some(Duration::from_secs(2))));
+        assert_eq!(secs("1", 170_000), Ok(Some(Duration::from_secs(1))));
+        assert_eq!(connect_timeout(None, 170_000), Ok(None));
+        for bad in ["", " ", "10x", "1 0", "1.5", "2147483648", "-2147483649"] {
+            assert_eq!(
+                secs(bad, 170_000),
+                Err(format!(
+                    "invalid integer value \"{bad}\" for connection option \"connect_timeout\""
+                ))
+            );
+        }
+    }
+
+    fn target(host: Option<&str>, hostaddr: Option<&str>, port: Option<&str>) -> ConnectTarget {
+        ConnectTarget {
+            host: host.map(str::to_owned),
+            hostaddr: hostaddr.map(str::to_owned),
+            port: port.map(str::to_owned),
+        }
+    }
+
+    /// Host, hostaddr and port lists pair up the way libpq pairs them, with libpq's messages when they do not.
+    #[test]
+    fn connect_slots_pair_lists_as_libpq_does() {
+        assert_eq!(
+            connect_slots(None, None, None),
+            Ok(vec![target(None, None, None)])
+        );
+        assert_eq!(
+            connect_slots(Some("a,b"), None, Some("1")),
+            Ok(vec![
+                target(Some("a"), None, Some("1")),
+                target(Some("b"), None, Some("1"))
+            ])
+        );
+        assert_eq!(
+            connect_slots(Some("a,"), None, Some("1,2")),
+            Ok(vec![
+                target(Some("a"), None, Some("1")),
+                target(Some(""), None, Some("2"))
+            ])
+        );
+        assert_eq!(
+            connect_slots(Some("a,b"), Some("10.0.0.1,10.0.0.2"), None),
+            Ok(vec![
+                target(Some("a"), Some("10.0.0.1"), None),
+                target(Some("b"), Some("10.0.0.2"), None)
+            ])
+        );
+        assert_eq!(
+            connect_slots(None, Some("10.0.0.1,10.0.0.2"), Some("5")),
+            Ok(vec![
+                target(None, Some("10.0.0.1"), Some("5")),
+                target(None, Some("10.0.0.2"), Some("5"))
+            ])
+        );
+        assert_eq!(
+            connect_slots(Some("a,b,c"), Some("10.0.0.1,10.0.0.2"), None),
+            Err("could not match 3 host names to 2 hostaddr values".to_string())
+        );
+        assert_eq!(
+            connect_slots(Some("a,b"), None, Some("1,2,3")),
+            Err("could not match 3 port numbers to 2 hosts".to_string())
+        );
+    }
+
+    /// `prefer-standby` tries every address as a standby first, then every address again in any mode.
+    #[test]
+    fn prefer_standby_plans_a_standby_pass_before_an_any_pass() {
+        let a1 = target(Some("a"), Some("10.0.0.1"), None);
+        let a2 = target(Some("a"), Some("10.0.0.2"), None);
+        let b = target(Some("b"), Some("10.0.0.3"), None);
+        let addresses = vec![vec![a1.clone(), a2.clone()], vec![b.clone()]];
+        let plan = |prefer_standby| {
+            plan_attempts(addresses.clone(), prefer_standby)
+                .into_iter()
+                .map(|attempt| (attempt.target, attempt.session_attrs))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            plan(false),
+            vec![(a1.clone(), None), (a2.clone(), None), (b.clone(), None)]
+        );
+        assert_eq!(
+            plan(true),
+            vec![
+                (a1.clone(), Some(c"standby")),
+                (a2.clone(), Some(c"standby")),
+                (b.clone(), Some(c"standby")),
+                (a1, Some(c"any")),
+                (a2, Some(c"any")),
+                (b, Some(c"any")),
+            ]
+        );
     }
 
     // === PgResult::get_bytes / get_bytes_owned ===

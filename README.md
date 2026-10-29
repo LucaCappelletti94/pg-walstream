@@ -337,7 +337,7 @@ Three conninfo options bound three different things, and they are easy to mistak
 
 | Option | Unit | Bounds |
 |---|---|---|
-| `connect_timeout` | seconds | Only the TCP connect. On the native backend TLS negotiation and startup/auth are **not** covered; libpq bounds the whole attempt. |
+| `connect_timeout` | seconds | Only the TCP connect. On the native backend TLS negotiation and startup/auth are **not** covered; libpq bounds the whole handshake with each address, then tries the next host. |
 | `keepalives_idle` / `_interval` / `_count` | seconds | An **idle** connection. Defaults `120`/`10`/`3` — roughly 150 s to notice a peer that vanished while nothing was in flight. |
 | `tcp_user_timeout` | **milliseconds** | An unacknowledged **write**. This is the only one that bounds a blocking round-trip — including the `DROP_REPLICATION_SLOT` that snapshot cleanup runs from `Drop`. Linux-family only; `0` (the default) disables it. |
 

@@ -805,11 +805,14 @@ impl LogicalReplicationStream {
             with_connect_timeout(connection_string, config.connection_timeout),
         );
 
-        let (connection, identity) = timeout_or_error(config.connection_timeout, async {
-            let mut connection = retry_handler.connect_with_retry().await?;
-            let identity = ServerIdentity::identify(&mut connection).await?;
-            Ok((connection, identity))
-        })
+        // `connect_timeout` bounds each address, so the budget only stops the retries between attempts.
+        let mut connection = retry_handler
+            .connect_with_retry_within(config.connection_timeout)
+            .await?;
+        let identity = timeout_or_error(
+            config.connection_timeout,
+            ServerIdentity::identify(&mut connection),
+        )
         .await?;
         info!(
             "Connected to system {} on timeline {}",
@@ -1387,12 +1390,11 @@ impl LogicalReplicationStream {
         // The new connection resends everything from the applied position, held frame included.
         self.reset_barrier();
 
-        // Attempt reconnection with retry logic and enforce timeout
-        self.connection = timeout_or_error(
-            self.config.connection_timeout,
-            self.retry_handler.connect_with_retry(),
-        )
-        .await?;
+        // Attempt reconnection with retry logic. `connect_timeout` bounds each address, so the budget only stops the retries between attempts.
+        self.connection = self
+            .retry_handler
+            .connect_with_retry_within(self.config.connection_timeout)
+            .await?;
 
         // A reconnect can land somewhere other than where we left off, and the stored LSN is only meaningful on the original cluster and timeline. A malformed reply fails closed with `PermanentConnection`, never `ReplicationSlot`, which would send an operator to drop a healthy slot.
         let current = ServerIdentity::identify(&mut self.connection).await?;
@@ -2901,9 +2903,10 @@ impl<'a> EventStreamRef<'a> {
 /// Fold `connection_timeout` into the connection string as `connect_timeout`
 /// unless the caller already set one.
 ///
-/// The outer [`timeout_or_error`] bounds the whole retry loop. `connect_timeout`
-/// also bounds each attempt, so the per-attempt handshake gives up on its own
-/// even when nothing above it is waiting. A caller who sets it explicitly wins.
+/// `connect_timeout` is the bound on each address a connect tries, which is what
+/// lets a multi-host connection string move past a silent host.
+/// `connection_timeout` also stops the retries between attempts. A caller who
+/// sets `connect_timeout` explicitly wins.
 /// `Duration::ZERO` means "no timeout", matching libpq, so it adds nothing.
 fn with_connect_timeout(conn_str: &str, timeout: Duration) -> String {
     if timeout.is_zero() || conn_str.contains("connect_timeout") {
@@ -2926,9 +2929,7 @@ async fn timeout_or_error<T>(
 ) -> Result<T> {
     match tokio::time::timeout(duration, future).await {
         Ok(result) => result,
-        Err(_) => Err(ReplicationError::timeout(format!(
-            "Connection attempt exceeded timeout of {duration:?}"
-        ))),
+        Err(_) => Err(crate::retry::connect_budget_exceeded(duration)),
     }
 }
 
@@ -4865,9 +4866,8 @@ pub(crate) mod tests {
         assert!(data.is_empty());
     }
 
-    /// `timeout_or_error` cannot bound the blocking connect inside
-    /// `connect_with_retry`, so the deadline has to travel in the connection
-    /// string. Both DSN syntaxes, and an explicit caller value always wins.
+    /// The per-address deadline travels in the connection string, in both DSN
+    /// syntaxes, and an explicit caller value always wins.
     #[test]
     fn with_connect_timeout_supplies_a_default_in_both_dsn_syntaxes() {
         let t = Duration::from_secs(30);
