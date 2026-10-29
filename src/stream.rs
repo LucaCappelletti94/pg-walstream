@@ -868,11 +868,11 @@ impl LogicalReplicationStream {
 
     /// The history of the timeline in [`server_identity`](Self::server_identity), oldest ancestor first, read on the stream's own connection.
     ///
-    /// Empty on timeline 1, which has no ancestors. Like [`slot_confirmed_flush_lsn`](Self::slot_confirmed_flush_lsn), it must run before [`start`](Self::start).
+    /// Empty on timeline 1, which has no ancestors, without a round trip. On any later timeline it must run before [`start`](Self::start), like [`slot_confirmed_flush_lsn`](Self::slot_confirmed_flush_lsn).
     ///
     /// # Errors
     ///
-    /// Returns an error when the stream is already streaming, when `TIMELINE_HISTORY` fails, or when its reply is not a well-formed history of that timeline.
+    /// Returns an error when `TIMELINE_HISTORY` fails, which it does once the stream is streaming, or when its reply is not a well-formed history of that timeline.
     pub async fn timeline_history(&mut self) -> Result<Vec<TimelineSwitch>> {
         let timeline = self.identity.timeline;
         if timeline == 1 {
